@@ -19,8 +19,10 @@ import kotlin.math.max
  */
 object AudioUtils {
     const val TARGET_SAMPLE_RATE = 16000
-    private const val MAX_ASR_DURATION_MS = 10 * 60 * 1000L
-    private const val MAX_TARGET_SAMPLE_COUNT = TARGET_SAMPLE_RATE * 60 * 10L
+    private const val MAX_ASR_DURATION_MINUTES = 30L
+    private const val MAX_ASR_DURATION_MS = MAX_ASR_DURATION_MINUTES * 60 * 1000L
+    private const val MAX_TARGET_SAMPLE_COUNT =
+        TARGET_SAMPLE_RATE * 60L * MAX_ASR_DURATION_MINUTES
 
     fun readAudioAsFloat(filePath: String, targetSampleRate: Int = TARGET_SAMPLE_RATE): FloatArray {
         val inputFile = File(filePath)

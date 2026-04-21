@@ -1,212 +1,287 @@
-# Shadowing Trainer — Android 原生重构
+# Shadowing Trainer for Android
 
-## 源仓库
+一个**本地优先**的英语 Shadowing（跟读）训练应用，使用 **Jetpack Compose + Room + Moonshine ASR** 构建，完整闭环在 Android 端完成：
 
-- **GitHub**: https://github.com/Orien233/Shadowing-Trainer
-- **当前分支**: v0_3
-- **原架构**: React 18 + TypeScript + Vite (前端) / Python 3.10+ + FastAPI + SQLModel + SQLite (后端)
-- **原依赖**: faster-whisper, FFmpeg/ffprobe, librosa, soundfile, httpx, DeepSeek API
+> 导入素材 → 自动/手动生成句子 → 逐句播放 → 录音 → 本地转写 → 文本比对评分 → 保存历史结果
 
-## 原产品概述
+---
 
-本地优先的英语口语跟读训练 Web 应用。核心流程：上传音频/视频素材 → 标准化为 16kHz WAV → faster-whisper ASR 转写 → 切句 → DeepSeek 翻译 → 句级播放训练 → 用户录音 → 后端评分（完整度/流利度/同步度/发音）→ 评分快照保存。
+## 1. 项目现状（与代码一致）
 
-## 目标架构
+当前仓库已经是 Android 单端工程，不再依赖原来的 Web + Python 后端架构。
 
-**单端本地 Android 原生应用**，不再保留 Web 前后端。
+### 已实现核心能力
 
-| 层 | 技术选型 |
-|----|----------|
-| UI | Jetpack Compose |
-| 状态管理 | ViewModel + StateFlow |
-| 数据库 | Room |
-| 文件存储 | Android 私有目录 |
-| 播放 | Android 原生 MediaPlayer/ExoPlayer |
-| 录音 | Android 原生 MediaRecorder |
-| ASR | Moonshine（本地） |
-| 业务组织 | Repository / UseCase |
-| 设置存储 | DataStore |
+- 素材列表：展示、重命名、删除素材。
+- 三种导入方式：
+    - 导入素材包目录（`meta.json` + `sentences.json` + 可选媒体/clip）
+    - 导入单个音/视频文件（调用 Moonshine 自动转写并切句）
+    - 一键导入 Demo 素材
+- 句子列表：展示每句文本与最近一次成绩。
+- 训练页：逐句播放、变速、循环、上下句切换。
+- 录音评估：麦克风录音（WAV）→ Moonshine 本地转写 → 词级比对评分。
+- 结果存储：保存练习记录并回填句级 latest result。
+- 视频播放：当素材为视频时，训练页使用 ExoPlayer 视频面板播放。
 
-## 数据实体设计
+---
 
-### Material
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| id | Long (PK) | |
-| title | String | |
-| type | String | audio/video |
-| sourcePath | String? | 原始文件路径 |
-| coverPath | String? | 封面 |
-| language | String | |
-| createdAt | Long | |
-| updatedAt | Long | |
+## 2. 技术栈
 
-### Sentence
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| id | Long (PK) | |
-| materialId | Long (FK) | |
-| index | Int | 句子序号 |
-| textOriginal | String | 英文原文 |
-| textZh | String? | 中文释义（第一阶段可为空） |
-| startTimeMs | Long? | 开始时间 |
-| endTimeMs | Long? | 结束时间 |
-| clipPath | String? | 句子音频片段路径 |
-| createdAt | Long | |
+- **UI**: Jetpack Compose + Material 3
+- **架构**: ViewModel + StateFlow + Repository + UseCase
+- **依赖注入**: Hilt
+- **本地数据库**: Room
+- **播放**: Media3 ExoPlayer
+- **录音**: AudioRecord（16kHz, mono, PCM16 WAV）
+- **ASR**: Moonshine（JNI + C++ + ONNX Runtime，本地推理）
+- **最低系统**: Android 8.0 (API 26)
+- **构建**: AGP 8.7.3, Kotlin 2.1.0, Java 17, NDK + CMake
 
-### PracticeRecord
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| id | Long (PK) | |
-| materialId | Long (FK) | |
-| sentenceId | Long (FK) | |
-| recordingPath | String | 录音文件路径 |
-| recognizedText | String | Moonshine 转写结果 |
-| matchScore | Float | 比对得分 |
-| errorTags | String? | 错误标记 JSON |
-| createdAt | Long | |
+---
 
-### SentenceLatestResult
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| sentenceId | Long (PK) | |
-| latestPracticeRecordId | Long | |
-| latestRecognizedText | String | |
-| latestScore | Float | |
-| updatedAt | Long | |
+## 3. 页面与流程
 
-### Settings
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| key | String (PK) | |
-| value | String | |
+### 3.1 MaterialList（素材列表）
 
-Settings 内容：playbackSpeed, loopCurrentSentence, keepRecordings, moonshineModelPath, appLanguage
+入口页支持：
+- 查看所有素材
+- 点击进入句子列表
+- 底部弹窗执行导入（目录 / 媒体文件 / Demo）
+- 素材重命名、删除
 
-## 改动清单（12 项）
+### 3.2 SentenceList（句子列表）
 
-### 1. 项目形态
-删除 Web 前端 + Python 后端双端结构，改为单一 Android Studio 工程。废弃 frontend/src、backend/app、uvicorn、npm run dev。
+- 展示句子原文、可选注释（`textZh`）
+- 展示每句最近一次识别文本与分数
+- 点击进入训练页
 
-### 2. 数据层
-SQLModel + SQLite → Room。表：materials, sentences, practice_records, latest_scores, settings。级联删除逻辑改为 Room + 本地文件联动。
+### 3.3 Training（训练页）
 
-### 3. 文件系统
-backend/data/materials、audio、audio/sentences、recordings → Android 私有存储目录。按 material/sentence/recording 分层。
+- 目标句展示
+- 音频/视频播放，支持 `0.5x / 0.75x / 1.0x / 1.25x / 1.5x`
+- 单句循环播放
+- 录音开始/停止/取消
+- 本地 ASR 转写
+- 对比结果展示：得分、漏词、增词、错词、简评
+- 上一句/下一句导航
 
-### 4. ASR
-faster-whisper → Moonshine（安卓端本地集成）。重新设计录音输入、音频预处理、转写调用、结果回填。
+---
 
-### 5. 媒体处理
-FFmpeg/ffprobe Python 工具链 → 安卓本地媒体方案。第一阶段采用"预处理材料包"或"手动导入句子与时间戳"，不做自动切句。
+## 4. 数据模型（Room）
 
-### 6. 翻译
-DeepSeek API → 移除在线翻译。中文释义通过预置数据导入，或允许为空。
+### `materials`
 
-### 7. 评分
-后端四维评分（完整度/流利度/同步度/发音）+ VAD → 第一阶段只做"本地转写文本 vs 目标文本"轻量比对。输出简单得分、漏词、错词。
+- `id` 主键
+- `title`
+- `type`（`audio` / `video`）
+- `sourcePath`（整段媒体）
+- `coverPath`（暂未实际使用）
+- `language`
+- `createdAt`, `updatedAt`
 
-### 8. API
-HTTP API（/api/materials 等）→ Android 本地 Repository/UseCase 调用。去 API 化。
+### `sentences`
 
-### 9. 页面与交互
-Web 页面 → Compose 原生 UI。
-保留：素材列表、句子列表、逐句播放、上下句切换、循环播放、录音、识别文本、比对结果、历史成绩。
-放弃：Web 菜单细节、网页时间轴浮层、后端状态轮询、系统关闭按钮。
+- `id` 主键
+- `materialId`（FK）
+- `index`
+- `textOriginal`
+- `textZh`（可空）
+- `startTimeMs`, `endTimeMs`（可空）
+- `clipPath`（可空）
+- `createdAt`
 
-### 10. 材料处理策略
-"上传后自动触发 processing" → "导入即使用"。材料格式：material 元数据 + sentences 列表 + 可选整段媒体 + 可选每句 clip。
+### `practice_records`
 
-### 11. 视频能力
-第一阶段优先音频材料。视频同步作为第二阶段功能。
+- `id` 主键
+- `materialId`, `sentenceId`（FK）
+- `recordingPath`
+- `recognizedText`
+- `matchScore`
+- `errorTags`（JSON）
+- `createdAt`
 
-### 12. 运行方式
-Python + Node.js + FFmpeg + PyTorch + uvicorn + npm → 单一 Android APK。
+### `sentence_latest_results`
 
-## 第一阶段必须保留的核心能力
+- `sentenceId` 主键（FK）
+- `latestPracticeRecordId`
+- `latestRecognizedText`
+- `latestScore`
+- `updatedAt`
 
-1. 素材列表
-2. 句子列表
-3. 逐句播放
-4. 上一句/下一句切换
-5. 当前句循环播放
-6. 用户录音
-7. 本地 Moonshine 转写
-8. 目标句与识别句文本比对
-9. 保存历史练习记录
-10. 查看每句最近一次练习结果
+---
 
-## 第一阶段明确不做
+## 5. 导入格式说明
 
-- React 前端迁移
-- FastAPI 后端迁移
-- Python requirements 迁移
-- faster-whisper 迁移
-- DeepSeek 翻译
-- FFmpeg/ffprobe 自动处理
-- 自动 ASR 切句
-- 复杂发音/韵律/sync 评分
-- latest-evaluations HTTP API
-- system/shutdown API
-- 后端 processing lock / VAD 裁剪
-- Web 风格时间轴和素材菜单 UI
+### 5.1 素材包目录导入
 
-## 材料导入策略
+目录至少包含：
 
-第一阶段支持"预处理材料包导入"，包含：
-- material 元数据文件
-- sentences 列表文件
-- 可选整段音频/视频
-- 可选每句 clip 文件
+```text
+my_material/
+├── meta.json
+└── sentences.json
+```
 
-有整段媒体 + 时间戳 → 按时间区间播放
-有 clip 文件 → 优先直接播放 clip
+可选包含：
+- 根目录媒体文件（如 `source.mp3` / `source.mp4`）
+- 句级 clip 文件（在 `sentences.json` 中通过 `clipFile` 相对路径引用）
 
-## 文本比对策略
+`meta.json` 示例：
 
-轻量文本级比对，不要求音素/声学级分析。
-输出：recognizedText, matchScore, missedWords, extraWords, wrongWords, simpleFeedback
-方法：字符串归一化 + token 级对齐。
+```json
+{
+  "title": "Daily English - Episode 1",
+  "type": "audio",
+  "language": "en"
+}
+```
 
-## 迁移优先级
+`sentences.json` 示例：
 
-### P0（最小闭环）
-本地数据库 → 材料导入 → 句子训练页 → 播放 → 录音 → Moonshine 转写 → 文本比对 → 保存记录
+```json
+[
+  {
+    "index": 0,
+    "textOriginal": "Hello, how are you today?",
+    "textZh": "问候",
+    "startTimeMs": 0,
+    "endTimeMs": 3200,
+    "clipFile": "clips/s0.wav"
+  }
+]
+```
 
-### P1
-最近一次成绩回填 → 历史练习记录页 → 设置页 → 材料删除与联动文件清理
+### 5.2 单媒体文件导入
 
-### P2
-视频材料支持 → 更丰富的句子导航 → 更好的比对可视化 → 更完善的导入格式
+支持选择音频或视频文件。
 
-## 实现原则
+流程：
+1. 复制到缓存目录
+2. 调用 Moonshine 转写
+3. 按转写行生成 `sentences.json`
+4. 复用素材包导入逻辑落库
 
-1. 优先跑通完整闭环，不追求复杂自动化
-2. 优先保证本地可用，不依赖网络
-3. 优先保证英语 shadowing 场景
-4. 优先复用原仓库产品逻辑，不复用技术栈
-5. 第一阶段只做最小可交付版本
-6. 以 Android 原生单端架构为准
+---
 
-## 代码改造任务清单
+## 6. 播放策略
 
-- [ ] 新建 Android Studio 项目结构
-- [ ] 设计本地数据库 schema
-- [ ] 实现 Room 实体、DAO、Repository
-- [ ] 实现材料导入模块
-- [ ] 实现本地文件落盘与删除策略
-- [ ] 实现素材列表页
-- [ ] 实现句子列表页
-- [ ] 实现训练页
-- [ ] 实现句子播放控制
-- [ ] 实现录音流程
-- [ ] 接入 Moonshine 本地转写
-- [ ] 实现转写结果回填
-- [ ] 实现目标句与识别句文本比对
-- [ ] 实现基础得分计算
-- [ ] 实现最近一次成绩回填
-- [ ] 实现历史练习记录页
-- [ ] 实现基础设置页
-- [ ] 移除所有 Web API 依赖
-- [ ] 移除所有 Python/FastAPI/faster-whisper/DeepSeek 依赖
-- [ ] 将产品逻辑重写为本地安卓业务流
+训练页按以下优先级选择播放源：
+
+1. 如果素材是视频：优先使用视频源（clip 为视频则优先 clip）
+2. 否则如果句子有 `clipPath`：直接播 clip
+3. 否则播放素材 `sourcePath`，若有时间戳则按片段播放
+4. 无可用媒体则提示不可播放
+
+---
+
+## 7. 文本比对策略（当前评分）
+
+`TextCompareUseCase` 使用轻量词级编辑距离对齐（Match/Replace/Delete/Insert）：
+
+- `matchScore = matchedWords / targetWords`
+- 输出：
+    - `missedWords`
+    - `extraWords`
+    - `wrongWords`
+    - `simpleFeedback`
+
+这是第一阶段“可用优先”的实现，不做音素级/声学级评分。
+
+---
+
+## 8. 本地存储约定
+
+应用私有目录：
+
+```text
+files/shadowing_data/
+└── materials/{materialId}/
+    ├── <source media>
+    ├── clips/... (如果素材包提供)
+    └── recordings/
+        └── rec_{sentenceId}_{timestamp}.wav
+```
+
+数据库文件：`shadowing.db`。
+
+---
+
+## 9. Moonshine 模型与原生层
+
+- JNI 库：`shadowing-moonshine`（`app/src/main/cpp`）
+- Moonshine C++ core 已放在 `app/src/main/cpp/moonshine-core`
+- 项目自带模型资源：`app/src/main/assets/moonshine/medium-streaming-en`
+- `MoonshineAsr` 启动时会优先尝试从 assets 提取并加载模型到 `files/moonshine/...`
+
+如果你需要重新准备环境，可参考：
+- `docs/MOONSHINE_SETUP.md`
+- `scripts/setup_moonshine.sh`
+
+---
+
+## 10. 开发与运行
+
+### 环境要求
+
+- Android Studio（建议新版本）
+- Android SDK（compile/target 35）
+- NDK `27.0.12077973`
+- CMake `3.22.1`
+- JDK 17
+
+### 启动步骤
+
+```bash
+# 1) 打开工程
+# Android Studio 打开本仓库根目录
+
+# 2) 同步依赖
+# Sync Project with Gradle Files
+
+# 3) 构建并运行
+# 运行 app 模块到 arm64-v8a 设备/模拟器
+```
+
+> 注意：`abiFilters` 当前只包含 `arm64-v8a`，请使用 arm64 设备或对应模拟器。
+
+---
+
+## 11. 当前限制与后续方向
+
+### 当前限制
+
+- 文本比对仅词级，不含发音韵律评估
+- 暂无设置页（DataStore 依赖已引入，但功能未落地）
+- 导入媒体时默认语言 `en`
+- `READ_MEDIA_VIDEO` 未声明，视频导入能力可能受系统版本/厂商行为影响（当前主要声明了音频读取权限）
+
+### 后续建议
+
+- 增加设置中心（播放速度默认值、循环策略、模型切换）
+- 引入更细粒度评分（发音、停顿、语速）
+- 补齐历史练习记录页与可视化趋势
+- 完善视频权限与导入兼容性
+
+---
+
+## 12. 目录结构速览
+
+```text
+app/src/main/java/com/orien/shadowing/
+├── data/
+│   ├── local/          # 播放、录音、ASR、DAO、Repository
+│   └── model/          # Room 实体
+├── domain/usecase/     # 导入、Demo 生成、文本比对
+├── presentation/
+│   ├── materiallist/
+│   ├── sentencelist/
+│   ├── training/
+│   └── navigation/
+├── di/                 # Hilt Module
+└── MainActivity.kt
+
+app/src/main/cpp/       # Moonshine JNI + C++ core
+app/src/main/assets/    # Moonshine 模型资源
+docs/                   # 补充文档
+scripts/                # 环境脚本
+```

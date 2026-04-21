@@ -1,5 +1,6 @@
 package com.orien.shadowing.data.local
 
+import android.util.Log
 import android.content.Context
 import com.orien.shadowing.data.local.moonshine.AudioUtils
 import com.orien.shadowing.data.local.moonshine.MoonshineTranscriber
@@ -13,6 +14,7 @@ import javax.inject.Singleton
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.system.measureTimeMillis
 
 /**
  * On-device ASR wrapper backed by Moonshine.
@@ -53,8 +55,11 @@ class MoonshineAsr @Inject constructor(
     private var lastInitErrorMessage: String? = null
 
     companion object {
+        private const val TAG = "MoonshineAsr"
         private const val MIN_CHUNK_DURATION_MS = 20_000L
-        private const val MAX_CHUNK_DURATION_MS = 180_000L
+        // Large ASR chunks make long imports look hung on slower devices. Keep the upper bound
+        // conservative so decode/transcribe progress stays visible and failures isolate faster.
+        private const val MAX_CHUNK_DURATION_MS = 60_000L
         private const val CHUNK_OVERLAP_MS = 2_000L
         private const val CHUNK_HEAP_FRACTION = 0.08
         private const val BYTES_PER_SAMPLE = 4L
@@ -108,6 +113,11 @@ class MoonshineAsr @Inject constructor(
 
             try {
                 val file = File(audioPath)
+                Log.i(
+                    TAG,
+                    "Starting ASR for ${file.name}: useChunked=${shouldUseChunkedTranscription(file)}, " +
+                        "durationMs=${AudioUtils.resolveMediaDurationMs(audioPath) ?: -1L}"
+                )
                 val result = if (shouldUseChunkedTranscription(file)) {
                     transcribeInChunks(file, loadedTranscriber)
                 } else {
@@ -122,12 +132,19 @@ class MoonshineAsr @Inject constructor(
                         confidence = 1f
                     )
                 }
-                result.copy(durationMs = System.currentTimeMillis() - startTime)
+                result.copy(durationMs = System.currentTimeMillis() - startTime).also { finalResult ->
+                    Log.i(
+                        TAG,
+                        "Finished ASR for ${file.name}: elapsedMs=${finalResult.durationMs}, " +
+                            "lineCount=${finalResult.lines.size}, disputedCount=${finalResult.disputedLines.size}, " +
+                            "error=${finalResult.errorMessage}"
+                    )
+                }
             } catch (error: Throwable) {
                 if (error is CancellationException) {
                     throw error
                 }
-                android.util.Log.e("MoonshineAsr", "Failed to transcribe $audioPath", error)
+                Log.e(TAG, "Failed to transcribe $audioPath", error)
                 AsrResult(
                     text = "",
                     durationMs = System.currentTimeMillis() - startTime,
@@ -156,6 +173,7 @@ class MoonshineAsr @Inject constructor(
         val disputedLines = mutableListOf<AsrLine>()
         var previousTailLines: List<AsrLine> = emptyList()
         var chunkStartMs = 0L
+        var chunkIndex = 0
 
         while (true) {
             val chunkEndMs = if (totalDurationMs != null) {
@@ -163,16 +181,40 @@ class MoonshineAsr @Inject constructor(
             } else {
                 chunkStartMs + chunkDurationMs
             }
-            val chunkSamples = AudioUtils.decodeMediaSegmentAsFloat(
-                filePath = file.absolutePath,
-                startTimeMs = chunkStartMs,
-                endTimeMs = chunkEndMs,
-                targetSampleRate = AudioUtils.TARGET_SAMPLE_RATE
-            )
+            lateinit var chunkSamples: FloatArray
+            val decodeElapsedMs = measureTimeMillis {
+                chunkSamples = AudioUtils.decodeMediaSegmentAsFloat(
+                    filePath = file.absolutePath,
+                    startTimeMs = chunkStartMs,
+                    endTimeMs = chunkEndMs,
+                    targetSampleRate = AudioUtils.TARGET_SAMPLE_RATE
+                )
+            }
             if (chunkSamples.isEmpty()) {
+                Log.i(
+                    TAG,
+                    "Stopping chunked ASR for ${file.name}: chunk=$chunkIndex, " +
+                        "range=${chunkStartMs}..${chunkEndMs}ms decoded no samples."
+                )
                 break
             }
-            val chunkTranscript = loadedTranscriber.transcribe(chunkSamples, AudioUtils.TARGET_SAMPLE_RATE)
+            Log.i(
+                TAG,
+                "ASR chunk start for ${file.name}: chunk=$chunkIndex, " +
+                    "range=${chunkStartMs}..${chunkEndMs}ms, samples=${chunkSamples.size}, " +
+                    "decodeElapsedMs=$decodeElapsedMs"
+            )
+            lateinit var chunkTranscript: MoonshineTranscriber.Transcript
+            val transcribeElapsedMs = measureTimeMillis {
+                chunkTranscript = loadedTranscriber.transcribe(chunkSamples, AudioUtils.TARGET_SAMPLE_RATE)
+            }
+            Log.i(
+                TAG,
+                "ASR chunk finished for ${file.name}: chunk=$chunkIndex, " +
+                    "range=${chunkStartMs}..${chunkEndMs}ms, samples=${chunkSamples.size}, " +
+                    "decodeElapsedMs=$decodeElapsedMs, transcribeElapsedMs=$transcribeElapsedMs, " +
+                    "lineCount=${chunkTranscript.lines.size}"
+            )
             val normalizedChunkLines = normalizeLines(chunkTranscript.lines.asList(), offsetMs = chunkStartMs)
             if (chunkStartMs == 0L) {
                 mergedLines.addAll(normalizedChunkLines)
@@ -198,6 +240,7 @@ class MoonshineAsr @Inject constructor(
                 break
             }
             chunkStartMs += stepMs
+            chunkIndex += 1
         }
 
         val finalLines = applySmallPauseProtection(mergeDuplicateLines(mergedLines))

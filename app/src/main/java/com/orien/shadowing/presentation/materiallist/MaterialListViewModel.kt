@@ -14,6 +14,7 @@ import com.orien.shadowing.domain.usecase.ImportMaterialUseCase
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -22,6 +23,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
 import javax.inject.Inject
 
@@ -106,7 +108,9 @@ class MaterialListViewModel @Inject constructor(
                     return@launch
                 }
 
-                copyDocumentTree(root, tempDir)
+                withContext(Dispatchers.IO) {
+                    copyDocumentTree(root, tempDir)
+                }
 
                 when (val result = importMaterialUseCase.importFromDirectory(tempDir)) {
                     is ImportMaterialUseCase.ImportResult.Success -> {
@@ -155,11 +159,14 @@ class MaterialListViewModel @Inject constructor(
                 )
                 tempFile = copiedFile
 
-                context.contentResolver.openInputStream(uri)?.use { input ->
-                    copiedFile.outputStream().use { output ->
-                        input.copyTo(output)
-                    }
-                } ?: run {
+                val copiedSuccessfully = withContext(Dispatchers.IO) {
+                    context.contentResolver.openInputStream(uri)?.use { input ->
+                        copiedFile.outputStream().use { output ->
+                            input.copyTo(output)
+                        }
+                    } != null
+                }
+                if (!copiedSuccessfully) {
                     _uiState.update { it.copy(isLoading = false, importMessage = null) }
                     _events.emit(MaterialListEvent.ShowSnackbar("The selected media file could not be read."))
                     return@launch

@@ -1,5 +1,6 @@
 package com.orien.shadowing.data.local.moonshine
 
+import android.util.Log
 import android.media.AudioFormat
 import android.media.MediaCodec
 import android.media.MediaExtractor
@@ -20,6 +21,7 @@ import kotlin.math.min
  */
 object AudioUtils {
     const val TARGET_SAMPLE_RATE = 16000
+    private const val TAG = "AudioUtils"
     private const val MAX_ASR_DURATION_MINUTES = 30L
     private const val MAX_ASR_DURATION_MS = MAX_ASR_DURATION_MINUTES * 60 * 1000L
     private const val MAX_TARGET_SAMPLE_COUNT =
@@ -28,6 +30,8 @@ object AudioUtils {
     private const val MIN_RUNTIME_HEADROOM_BYTES = 32L * 1024L * 1024L
     private const val MAX_AUDIO_BUFFER_HEAP_FRACTION = 0.2
     private const val MIN_DEVICE_SAFE_DURATION_MINUTES = 2L
+    private const val CODEC_DEQUEUE_TIMEOUT_US = 10_000L
+    private const val MAX_DECODE_STALL_MS = 15_000L
 
     fun readAudioAsFloat(filePath: String, targetSampleRate: Int = TARGET_SAMPLE_RATE): FloatArray {
         val inputFile = File(filePath)
@@ -85,6 +89,81 @@ object AudioUtils {
             retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull()
         } finally {
             runCatching { retriever.release() }
+        }
+    }
+
+    fun writeMono16BitWav(
+        output: File,
+        samples: FloatArray,
+        sampleRate: Int = TARGET_SAMPLE_RATE
+    ) {
+        val bytesPerSample = 2
+        val dataSize = samples.size * bytesPerSample
+        val byteRate = sampleRate * bytesPerSample
+        val blockAlign = bytesPerSample
+        val chunkSize = 36 + dataSize
+
+        output.parentFile?.mkdirs()
+        output.outputStream().use { out ->
+            fun writeIntLE(value: Int) {
+                out.write(value and 0xFF)
+                out.write((value shr 8) and 0xFF)
+                out.write((value shr 16) and 0xFF)
+                out.write((value shr 24) and 0xFF)
+            }
+
+            fun writeShortLE(value: Int) {
+                out.write(value and 0xFF)
+                out.write((value shr 8) and 0xFF)
+            }
+
+            out.write(
+                byteArrayOf(
+                    'R'.code.toByte(),
+                    'I'.code.toByte(),
+                    'F'.code.toByte(),
+                    'F'.code.toByte()
+                )
+            )
+            writeIntLE(chunkSize)
+            out.write(
+                byteArrayOf(
+                    'W'.code.toByte(),
+                    'A'.code.toByte(),
+                    'V'.code.toByte(),
+                    'E'.code.toByte()
+                )
+            )
+            out.write(
+                byteArrayOf(
+                    'f'.code.toByte(),
+                    'm'.code.toByte(),
+                    't'.code.toByte(),
+                    ' '.code.toByte()
+                )
+            )
+            writeIntLE(16)
+            writeShortLE(1)
+            writeShortLE(1)
+            writeIntLE(sampleRate)
+            writeIntLE(byteRate)
+            writeShortLE(blockAlign)
+            writeShortLE(16)
+            out.write(
+                byteArrayOf(
+                    'd'.code.toByte(),
+                    'a'.code.toByte(),
+                    't'.code.toByte(),
+                    'a'.code.toByte()
+                )
+            )
+            writeIntLE(dataSize)
+
+            samples.forEach { sample ->
+                val clamped = sample.coerceIn(-1f, 1f)
+                val pcm = (clamped * 32767f).toInt()
+                writeShortLE(pcm)
+            }
         }
     }
 
@@ -148,6 +227,7 @@ object AudioUtils {
 
         var codec: MediaCodec? = null
         try {
+            val decodeStartMs = System.currentTimeMillis()
             val (audioTrackIndex, inputFormat) = selectAudioTrack(extractor, file)
 
             extractor.selectTrack(audioTrackIndex)
@@ -178,10 +258,12 @@ object AudioUtils {
             val decodedSamples = FloatAccumulator()
             var inputDone = false
             var outputDone = false
+            var lastProgressAtMs = System.currentTimeMillis()
 
             while (!outputDone) {
+                var madeProgress = false
                 if (!inputDone) {
-                    val inputIndex = codec.dequeueInputBuffer(10_000)
+                    val inputIndex = codec.dequeueInputBuffer(CODEC_DEQUEUE_TIMEOUT_US)
                     if (inputIndex >= 0) {
                         val inputBuffer = codec.getInputBuffer(inputIndex)
                             ?: throw IllegalStateException("Input buffer unavailable")
@@ -210,10 +292,11 @@ object AudioUtils {
                             )
                             extractor.advance()
                         }
+                        madeProgress = true
                     }
                 }
 
-                when (val outputIndex = codec.dequeueOutputBuffer(bufferInfo, 10_000)) {
+                when (val outputIndex = codec.dequeueOutputBuffer(bufferInfo, CODEC_DEQUEUE_TIMEOUT_US)) {
                     MediaCodec.INFO_TRY_AGAIN_LATER -> Unit
 
                     MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
@@ -227,6 +310,7 @@ object AudioUtils {
                         if (outputFormat.containsKey(MediaFormat.KEY_PCM_ENCODING)) {
                             pcmEncoding = outputFormat.getInteger(MediaFormat.KEY_PCM_ENCODING)
                         }
+                        madeProgress = true
                     }
 
                     else -> if (outputIndex >= 0) {
@@ -260,11 +344,29 @@ object AudioUtils {
                             }
                         }
                         codec.releaseOutputBuffer(outputIndex, false)
+                        madeProgress = true
 
                         if ((bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
                             outputDone = true
                         }
                     }
+                }
+
+                if (madeProgress) {
+                    lastProgressAtMs = System.currentTimeMillis()
+                } else if (System.currentTimeMillis() - lastProgressAtMs > MAX_DECODE_STALL_MS) {
+                    val rangeDescription = buildString {
+                        append(startTimeMs ?: 0L)
+                        append("..")
+                        append(endTimeMs?.toString() ?: "end")
+                        append("ms")
+                    }
+                    throw IOException(
+                        "Audio decode stalled for ${file.name} at $rangeDescription. " +
+                            "The media stream did not produce decoder progress for ${MAX_DECODE_STALL_MS}ms."
+                    )
+                } else {
+                    Thread.yield()
                 }
             }
 
@@ -277,6 +379,12 @@ object AudioUtils {
             if (enforceDurationLimit) {
                 ensureTargetSampleCountWithinLimit(normalizedSamples.size.toLong(), file.name)
             }
+            Log.i(
+                TAG,
+                "Decoded audio from ${file.name}: range=${startTimeMs ?: 0L}.." +
+                    "${endTimeMs?.toString() ?: "end"}ms, samples=${normalizedSamples.size}, " +
+                    "sampleRate=$sampleRate->$targetSampleRate, elapsedMs=${System.currentTimeMillis() - decodeStartMs}"
+            )
             return normalizedSamples
         } finally {
             runCatching { codec?.stop() }

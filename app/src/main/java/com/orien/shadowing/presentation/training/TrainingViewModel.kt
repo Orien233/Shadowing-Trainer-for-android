@@ -74,7 +74,8 @@ class TrainingViewModel @Inject constructor(
         val filePath: String,
         val startTimeMs: Long?,
         val endTimeMs: Long?,
-        val isVideo: Boolean
+        val isVideo: Boolean,
+        val fallbackAudioPath: String? = null
     )
 
     private val materialId: Long = savedStateHandle.get<Long>("materialId") ?: 0L
@@ -129,7 +130,8 @@ class TrainingViewModel @Inject constructor(
             filePath = playbackSource.filePath,
             startTimeMs = playbackSource.startTimeMs,
             endTimeMs = playbackSource.endTimeMs,
-            loop = state.loopEnabled
+            loop = state.loopEnabled,
+            fallbackAudioPath = playbackSource.fallbackAudioPath
         )
     }
 
@@ -362,6 +364,9 @@ class TrainingViewModel @Inject constructor(
         val sourcePath = material?.sourcePath?.takeIf { path ->
             path.isNotBlank() && File(path).exists()
         }
+        val fallbackAudioPath = material?.fallbackAudioPath?.takeIf { path ->
+            path.isNotBlank() && File(path).exists()
+        }
         val startTimeMs = sentence.startTimeMs
         val endTimeMs = sentence.endTimeMs
         val hasTimedSegment = startTimeMs != null && endTimeMs != null && endTimeMs > startTimeMs
@@ -371,6 +376,16 @@ class TrainingViewModel @Inject constructor(
 
         // If this material has a video source, prefer video playback over audio-only clips.
         if (sourcePath != null && sourceHasVideo) {
+            if (hasTimedSegment) {
+                return PlaybackSource(
+                    filePath = sourcePath,
+                    startTimeMs = startTimeMs,
+                    endTimeMs = endTimeMs,
+                    isVideo = true,
+                    fallbackAudioPath = fallbackAudioPath
+                )
+            }
+
             val videoClipPath = clipPath?.takeIf { isVideoSource(it, material?.type) }
             if (videoClipPath != null) {
                 return PlaybackSource(
@@ -381,21 +396,13 @@ class TrainingViewModel @Inject constructor(
                 )
             }
 
-            return if (hasTimedSegment) {
-                PlaybackSource(
-                    filePath = sourcePath,
-                    startTimeMs = startTimeMs,
-                    endTimeMs = endTimeMs,
-                    isVideo = true
-                )
-            } else {
-                PlaybackSource(
-                    filePath = sourcePath,
-                    startTimeMs = null,
-                    endTimeMs = null,
-                    isVideo = true
-                )
-            }
+            return PlaybackSource(
+                filePath = sourcePath,
+                startTimeMs = null,
+                endTimeMs = null,
+                isVideo = true,
+                fallbackAudioPath = fallbackAudioPath
+            )
         }
 
         if (clipPath != null) {
@@ -414,14 +421,16 @@ class TrainingViewModel @Inject constructor(
                 filePath = sourcePath,
                 startTimeMs = startTimeMs,
                 endTimeMs = endTimeMs,
-                isVideo = sourceHasVideo
+                isVideo = sourceHasVideo,
+                fallbackAudioPath = fallbackAudioPath
             )
         } else {
             PlaybackSource(
                 filePath = sourcePath,
                 startTimeMs = null,
                 endTimeMs = null,
-                isVideo = sourceHasVideo
+                isVideo = sourceHasVideo,
+                fallbackAudioPath = fallbackAudioPath
             )
         }
     }

@@ -28,6 +28,7 @@ object AppModule {
             AppDatabase::class.java,
             "shadowing.db"
         )
+            .addMigrations(AppDatabase.MIGRATION_1_2)
             .build()
 
     @Provides fun provideMaterialDao(db: AppDatabase): MaterialDao = db.materialDao()

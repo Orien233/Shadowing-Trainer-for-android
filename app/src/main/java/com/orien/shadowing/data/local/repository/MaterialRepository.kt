@@ -23,6 +23,7 @@ class MaterialRepository @Inject constructor(
         title: String,
         type: String,
         sourcePath: String? = null,
+        fallbackAudioPath: String? = null,
         coverPath: String? = null,
         language: String = "en"
     ): Long {
@@ -30,6 +31,7 @@ class MaterialRepository @Inject constructor(
             title = title,
             type = type,
             sourcePath = sourcePath,
+            fallbackAudioPath = fallbackAudioPath,
             coverPath = coverPath,
             language = language
         )

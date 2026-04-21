@@ -2,8 +2,11 @@ package com.orien.shadowing.domain.usecase
 
 import android.content.Context
 import android.media.MediaExtractor
+import android.util.Log
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
@@ -12,6 +15,7 @@ import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import java.io.File
 import javax.inject.Inject
+import kotlin.system.measureTimeMillis
 
 /**
  * Converts a raw audio/video file into the app's package format, then reuses the
@@ -22,19 +26,27 @@ class ImportMediaUseCase @Inject constructor(
     private val moonshineAsr: com.orien.shadowing.data.local.MoonshineAsr,
     private val importMaterialUseCase: ImportMaterialUseCase
 ) {
+    companion object {
+        private const val TAG = "ImportMediaUseCase"
+        const val DISPUTED_SENTENCES_FILE_NAME = "disputed_sentences.json"
+        private val VIDEO_EXTENSIONS = setOf("mp4", "mkv", "mov", "webm", "m4v", "3gp", "qt")
+        private val AUDIO_EXTENSIONS = setOf("mp3", "wav", "m4a", "ogg", "aac", "flac", "opus")
+        private val SUPPORTED_MEDIA_EXTENSIONS = VIDEO_EXTENSIONS + AUDIO_EXTENSIONS
+    }
+
     suspend fun importFromMediaFile(
         mediaFile: File,
         displayName: String = mediaFile.name,
         mimeType: String? = null
-    ): ImportMaterialUseCase.ImportResult {
+    ): ImportMaterialUseCase.ImportResult = withContext(Dispatchers.IO) {
         if (!mediaFile.exists() || !mediaFile.isFile) {
-            return ImportMaterialUseCase.ImportResult.Error(
+            return@withContext ImportMaterialUseCase.ImportResult.Error(
                 "Media file not found: ${mediaFile.absolutePath}"
             )
         }
 
         if (!isSupportedMediaFile(mediaFile, mimeType)) {
-            return ImportMaterialUseCase.ImportResult.Error(
+            return@withContext ImportMaterialUseCase.ImportResult.Error(
                 "Unsupported media file: ${displayName.ifBlank { mediaFile.name }}"
             )
         }
@@ -42,7 +54,7 @@ class ImportMediaUseCase @Inject constructor(
         val ready = moonshineAsr.initialize()
         if (!ready) {
             val detail = moonshineAsr.getLastInitErrorMessage()
-            return ImportMaterialUseCase.ImportResult.Error(
+            return@withContext ImportMaterialUseCase.ImportResult.Error(
                 if (detail.isNullOrBlank()) {
                     "Moonshine model is not available, so raw media cannot be processed yet."
                 } else {
@@ -57,10 +69,23 @@ class ImportMediaUseCase @Inject constructor(
 
             val packagedMediaFile = File(packageDir, buildPackagedMediaName(displayName, mediaFile))
             mediaFile.copyTo(packagedMediaFile, overwrite = true)
+            Log.i(
+                TAG,
+                "Copied media for import: source=${mediaFile.absolutePath}, package=${packagedMediaFile.absolutePath}"
+            )
 
-            val transcript = moonshineAsr.transcribe(packagedMediaFile.absolutePath)
+            lateinit var transcript: com.orien.shadowing.data.local.MoonshineAsr.AsrResult
+            val transcribeElapsedMs = measureTimeMillis {
+                transcript = moonshineAsr.transcribe(packagedMediaFile.absolutePath)
+            }
+            Log.i(
+                TAG,
+                "ASR finished for ${packagedMediaFile.name}: elapsedMs=$transcribeElapsedMs, " +
+                    "lineCount=${transcript.lines.size}, disputedCount=${transcript.disputedLines.size}, " +
+                    "error=${transcript.errorMessage}"
+            )
             if (transcript.errorMessage != null) {
-                return ImportMaterialUseCase.ImportResult.Error(
+                return@withContext ImportMaterialUseCase.ImportResult.Error(
                     "Failed to process media: ${transcript.errorMessage}"
                 )
             }
@@ -72,7 +97,7 @@ class ImportMediaUseCase @Inject constructor(
             }.sortedBy { it.startTimeMs }
 
             if (transcriptLines.isEmpty()) {
-                return ImportMaterialUseCase.ImportResult.Error(
+                return@withContext ImportMaterialUseCase.ImportResult.Error(
                     "No speech segments were detected in ${displayName.ifBlank { mediaFile.name }}."
                 )
             }
@@ -80,7 +105,7 @@ class ImportMediaUseCase @Inject constructor(
             writeMetaJson(
                 packageDir = packageDir,
                 title = buildMaterialTitle(displayName),
-                type = detectMaterialType(mediaFile, mimeType),
+                type = detectMaterialType(packagedMediaFile, mimeType),
                 language = "en"
             )
             writeSentencesJson(packageDir, transcriptLines)
@@ -88,12 +113,20 @@ class ImportMediaUseCase @Inject constructor(
                 writeDisputedSentencesJson(packageDir, disputedLines)
             }
 
-            return importMaterialUseCase.importFromDirectory(packageDir)
+            lateinit var importResult: ImportMaterialUseCase.ImportResult
+            val packageImportElapsedMs = measureTimeMillis {
+                importResult = importMaterialUseCase.importFromDirectory(packageDir)
+            }
+            Log.i(
+                TAG,
+                "Package import finished for ${packagedMediaFile.name}: elapsedMs=$packageImportElapsedMs, result=$importResult"
+            )
+            return@withContext importResult
         } catch (error: Throwable) {
             if (error is CancellationException) {
                 throw error
             }
-            return ImportMaterialUseCase.ImportResult.Error(
+            return@withContext ImportMaterialUseCase.ImportResult.Error(
                 "Failed to process media: ${error.message ?: "unknown error"}"
             )
         } finally {
@@ -223,12 +256,5 @@ class ImportMediaUseCase @Inject constructor(
         return mimeType?.startsWith("audio/") == true ||
             mimeType?.startsWith("video/") == true ||
             file.extension.lowercase() in SUPPORTED_MEDIA_EXTENSIONS
-    }
-
-    companion object {
-        const val DISPUTED_SENTENCES_FILE_NAME = "disputed_sentences.json"
-        private val VIDEO_EXTENSIONS = setOf("mp4", "mkv", "mov", "webm", "m4v", "3gp", "qt")
-        private val AUDIO_EXTENSIONS = setOf("mp3", "wav", "m4a", "ogg", "aac", "flac", "opus")
-        private val SUPPORTED_MEDIA_EXTENSIONS = VIDEO_EXTENSIONS + AUDIO_EXTENSIONS
     }
 }

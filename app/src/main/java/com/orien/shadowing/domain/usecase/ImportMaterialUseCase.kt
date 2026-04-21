@@ -2,17 +2,22 @@ package com.orien.shadowing.domain.usecase
 
 import android.content.Context
 import android.media.MediaExtractor
+import android.util.Log
+import com.orien.shadowing.data.local.media.PlaybackAssetPreparer
 import com.orien.shadowing.data.local.repository.MaterialRepository
 import com.orien.shadowing.data.model.SentenceEntity
 import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.Dispatchers
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.int
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.long
+import kotlinx.coroutines.withContext
 import java.io.File
 import javax.inject.Inject
+import kotlin.system.measureTimeMillis
 
 /**
  * Imports a pre-processed material package from a directory.
@@ -21,6 +26,30 @@ class ImportMaterialUseCase @Inject constructor(
     @ApplicationContext private val context: Context,
     private val materialRepository: MaterialRepository
 ) {
+    companion object {
+        private const val TAG = "ImportMaterialUseCase"
+        private val VIDEO_EXTENSIONS = setOf(
+            "mp4",
+            "mkv",
+            "mov",
+            "webm",
+            "m4v",
+            "3gp",
+            "qt"
+        )
+
+        private val SUPPORTED_MEDIA_EXTENSIONS = setOf(
+            "mp3",
+            "wav",
+            "m4a",
+            "ogg",
+            "aac",
+            "flac",
+            "opus",
+            *VIDEO_EXTENSIONS.toTypedArray()
+        )
+    }
+
     private enum class MediaKind {
         AUDIO,
         VIDEO,
@@ -32,20 +61,20 @@ class ImportMaterialUseCase @Inject constructor(
         data class Error(val message: String) : ImportResult()
     }
 
-    suspend fun importFromDirectory(packageDir: File): ImportResult {
+    suspend fun importFromDirectory(packageDir: File): ImportResult = withContext(Dispatchers.IO) {
         if (!packageDir.isDirectory) {
-            return ImportResult.Error("Not a directory: ${packageDir.absolutePath}")
+            return@withContext ImportResult.Error("Not a directory: ${packageDir.absolutePath}")
         }
 
         val metaFile = File(packageDir, "meta.json")
         if (!metaFile.exists()) {
-            return ImportResult.Error("Missing meta.json in ${packageDir.absolutePath}")
+            return@withContext ImportResult.Error("Missing meta.json in ${packageDir.absolutePath}")
         }
 
         val meta = try {
             Json.parseToJsonElement(metaFile.readText()).jsonObject
         } catch (error: Exception) {
-            return ImportResult.Error("Invalid meta.json: ${error.message}")
+            return@withContext ImportResult.Error("Invalid meta.json: ${error.message}")
         }
 
         val title = meta["title"]?.jsonPrimitive?.content ?: packageDir.name
@@ -54,18 +83,20 @@ class ImportMaterialUseCase @Inject constructor(
 
         val sentencesFile = File(packageDir, "sentences.json")
         if (!sentencesFile.exists()) {
-            return ImportResult.Error("Missing sentences.json in ${packageDir.absolutePath}")
+            return@withContext ImportResult.Error("Missing sentences.json in ${packageDir.absolutePath}")
         }
 
         val sentencesJson = try {
             Json.parseToJsonElement(sentencesFile.readText()).jsonArray
         } catch (error: Exception) {
-            return ImportResult.Error("Invalid sentences.json: ${error.message}")
+            return@withContext ImportResult.Error("Invalid sentences.json: ${error.message}")
         }
 
         val mediaCandidates = packageDir.listFiles()
             ?.filter { file ->
-                file.isFile && (
+                file.isFile &&
+                    file.name != PlaybackAssetPreparer.FALLBACK_AUDIO_FILE_NAME &&
+                    (
                     file.extension.lowercase() in SUPPORTED_MEDIA_EXTENSIONS ||
                         detectMediaKindFromTracks(file) != MediaKind.UNKNOWN
                     )
@@ -88,8 +119,30 @@ class ImportMaterialUseCase @Inject constructor(
         )
 
         val materialDir = File(storageRoot, "materials/$materialId").apply { mkdirs() }
-        val sourcePath = sourceMedia?.let { mediaFile ->
-            copyFile(mediaFile, File(materialDir, mediaFile.name)).absolutePath
+        val copiedSourceMedia = sourceMedia?.let { mediaFile ->
+            copyFile(mediaFile, File(materialDir, mediaFile.name))
+        }
+        val copiedFallbackAudio = copyOptionalFile(
+            sourceRoot = packageDir,
+            targetRoot = materialDir,
+            relativePath = PlaybackAssetPreparer.FALLBACK_AUDIO_FILE_NAME
+        )
+        val preparedAssets = copiedSourceMedia?.let { copiedMedia ->
+            var assets: PlaybackAssetPreparer.PreparedAssets? = null
+            val elapsedMs = measureTimeMillis {
+                assets = PlaybackAssetPreparer.prepare(
+                    materialDir = materialDir,
+                    sourceMediaFile = copiedMedia,
+                    existingFallbackAudio = copiedFallbackAudio
+                )
+            }
+            Log.i(
+                TAG,
+                "Playback asset preparation finished for ${copiedMedia.name}: elapsedMs=$elapsedMs, " +
+                    "usedCompatVideo=${assets?.usedCompatVideo == true}, " +
+                    "primary=${assets?.primaryMediaFile?.name}, fallback=${assets?.fallbackAudioFile?.name}"
+            )
+            assets
         }
         copyOptionalFile(
             sourceRoot = packageDir,
@@ -97,9 +150,16 @@ class ImportMaterialUseCase @Inject constructor(
             relativePath = ImportMediaUseCase.DISPUTED_SENTENCES_FILE_NAME
         )
 
-        if (sourcePath != null) {
+        val sourcePath = preparedAssets?.primaryMediaFile?.absolutePath
+        val fallbackAudioPath = preparedAssets?.fallbackAudioFile?.absolutePath
+        if (sourcePath != null || fallbackAudioPath != null) {
             materialRepository.getMaterial(materialId)?.let { material ->
-                materialRepository.updateMaterial(material.copy(sourcePath = sourcePath))
+                materialRepository.updateMaterial(
+                    material.copy(
+                        sourcePath = sourcePath,
+                        fallbackAudioPath = fallbackAudioPath
+                    )
+                )
             }
         }
 
@@ -121,7 +181,7 @@ class ImportMaterialUseCase @Inject constructor(
         }
 
         materialRepository.insertSentences(sentenceEntities)
-        return ImportResult.Success(materialId, sentenceEntities.size)
+        ImportResult.Success(materialId, sentenceEntities.size)
     }
 
     private fun getStorageRoot(): File = File(context.filesDir, "shadowing_data")
@@ -157,6 +217,12 @@ class ImportMaterialUseCase @Inject constructor(
         }
 
         val kindByFile = candidates.associateWith(::detectMediaKind)
+        candidates.firstOrNull { it.name.equals(PlaybackAssetPreparer.COMPAT_VIDEO_FILE_NAME, ignoreCase = true) }
+            ?.let { compatVideo ->
+                if (kindByFile[compatVideo] == MediaKind.VIDEO) {
+                    return compatVideo
+                }
+            }
         val preferredKind = when {
             declaredType.equals("video", ignoreCase = true) -> MediaKind.VIDEO
             declaredType.equals("audio", ignoreCase = true) -> MediaKind.AUDIO
@@ -226,26 +292,4 @@ class ImportMaterialUseCase @Inject constructor(
         item[key]?.jsonPrimitive?.long
     }.getOrNull()
 
-    companion object {
-        private val VIDEO_EXTENSIONS = setOf(
-            "mp4",
-            "mkv",
-            "mov",
-            "webm",
-            "m4v",
-            "3gp",
-            "qt"
-        )
-
-        private val SUPPORTED_MEDIA_EXTENSIONS = setOf(
-            "mp3",
-            "wav",
-            "m4a",
-            "ogg",
-            "aac",
-            "flac",
-            "opus",
-            *VIDEO_EXTENSIONS.toTypedArray()
-        )
-    }
 }

@@ -10,6 +10,7 @@ data class MaterialEntity(
     val title: String,
     val type: String, // "audio" or "video"
     val sourcePath: String?,
+    val fallbackAudioPath: String? = null,
     val coverPath: String?,
     val language: String = "en",
     val createdAt: Long = System.currentTimeMillis(),

@@ -14,9 +14,15 @@
 
 - 素材列表：展示、重命名、删除素材。
 - 三种导入方式：
+<<<<<<< HEAD
     - 导入素材包目录（`meta.json` + `sentences.json` + 可选媒体/clip）
     - 导入单个音/视频文件（调用 Moonshine 自动转写并切句）
     - 一键导入 Demo 素材
+=======
+  - 导入素材包目录（`meta.json` + `sentences.json` + 可选媒体/clip）
+  - 导入单个音/视频文件（调用 Moonshine 自动转写并切句）
+  - 一键导入 Demo 素材
+>>>>>>> 9ec53416b4202d2efab5c5de13087687f9483509
 - 句子列表：展示每句文本与最近一次成绩。
 - 训练页：逐句播放、变速、循环、上下句切换。
 - 录音评估：麦克风录音（WAV）→ Moonshine 本地转写 → 词级比对评分。
@@ -180,10 +186,17 @@ my_material/
 
 - `matchScore = matchedWords / targetWords`
 - 输出：
+<<<<<<< HEAD
     - `missedWords`
     - `extraWords`
     - `wrongWords`
     - `simpleFeedback`
+=======
+  - `missedWords`
+  - `extraWords`
+  - `wrongWords`
+  - `simpleFeedback`
+>>>>>>> 9ec53416b4202d2efab5c5de13087687f9483509
 
 这是第一阶段“可用优先”的实现，不做音素级/声学级评分。
 

@@ -1,6 +1,7 @@
 package com.orien.shadowing.domain.usecase
 
 import android.content.Context
+import android.media.MediaExtractor
 import com.orien.shadowing.data.local.repository.MaterialRepository
 import com.orien.shadowing.data.model.SentenceEntity
 import dagger.hilt.android.qualifiers.ApplicationContext
@@ -20,6 +21,12 @@ class ImportMaterialUseCase @Inject constructor(
     @ApplicationContext private val context: Context,
     private val materialRepository: MaterialRepository
 ) {
+    private enum class MediaKind {
+        AUDIO,
+        VIDEO,
+        UNKNOWN
+    }
+
     sealed class ImportResult {
         data class Success(val materialId: Long, val sentenceCount: Int) : ImportResult()
         data class Error(val message: String) : ImportResult()
@@ -58,14 +65,18 @@ class ImportMaterialUseCase @Inject constructor(
 
         val mediaCandidates = packageDir.listFiles()
             ?.filter { file ->
-                file.isFile && file.extension.lowercase() in SUPPORTED_MEDIA_EXTENSIONS
+                file.isFile && (
+                    file.extension.lowercase() in SUPPORTED_MEDIA_EXTENSIONS ||
+                        detectMediaKindFromTracks(file) != MediaKind.UNKNOWN
+                    )
             }
             .orEmpty()
         val sourceMedia = selectPrimaryMediaFile(mediaCandidates, type)
-        val resolvedType = when {
-            sourceMedia != null && isVideoFile(sourceMedia) -> "video"
-            sourceMedia != null -> "audio"
-            else -> type
+        val sourceMediaKind = sourceMedia?.let(::detectMediaKind) ?: MediaKind.UNKNOWN
+        val resolvedType = when (sourceMediaKind) {
+            MediaKind.VIDEO -> "video"
+            MediaKind.AUDIO -> "audio"
+            MediaKind.UNKNOWN -> if (type.equals("video", ignoreCase = true)) "video" else "audio"
         }
 
         val storageRoot = getStorageRoot().apply { mkdirs() }
@@ -145,14 +156,56 @@ class ImportMaterialUseCase @Inject constructor(
             return null
         }
 
-        val videos = candidates.filter(::isVideoFile)
-        val audios = candidates.filter { !isVideoFile(it) }
+        val kindByFile = candidates.associateWith(::detectMediaKind)
+        val preferredKind = when {
+            declaredType.equals("video", ignoreCase = true) -> MediaKind.VIDEO
+            declaredType.equals("audio", ignoreCase = true) -> MediaKind.AUDIO
+            else -> null
+        }
 
-        return when {
-            videos.isNotEmpty() -> videos.first()
-            declaredType.equals("audio", ignoreCase = true) && audios.isNotEmpty() -> audios.first()
-            audios.isNotEmpty() -> audios.first()
-            else -> candidates.first()
+        if (preferredKind != null) {
+            candidates.firstOrNull { file -> kindByFile[file] == preferredKind }?.let { return it }
+        }
+
+        return candidates.firstOrNull { file -> kindByFile[file] == MediaKind.VIDEO }
+            ?: candidates.firstOrNull { file -> kindByFile[file] == MediaKind.AUDIO }
+            ?: candidates.first()
+    }
+
+    private fun detectMediaKind(file: File): MediaKind {
+        val byTrack = detectMediaKindFromTracks(file)
+        if (byTrack != MediaKind.UNKNOWN) {
+            return byTrack
+        }
+        return if (isVideoFile(file)) MediaKind.VIDEO else MediaKind.AUDIO
+    }
+
+    private fun detectMediaKindFromTracks(file: File): MediaKind {
+        val extractor = MediaExtractor()
+        return try {
+            extractor.setDataSource(file.absolutePath)
+            var hasAudioTrack = false
+            var hasVideoTrack = false
+            for (index in 0 until extractor.trackCount) {
+                val mime = extractor.getTrackFormat(index).getString(android.media.MediaFormat.KEY_MIME)
+                when {
+                    mime?.startsWith("video/") == true -> hasVideoTrack = true
+                    mime?.startsWith("audio/") == true -> hasAudioTrack = true
+                }
+                if (hasVideoTrack) {
+                    break
+                }
+            }
+
+            when {
+                hasVideoTrack -> MediaKind.VIDEO
+                hasAudioTrack -> MediaKind.AUDIO
+                else -> MediaKind.UNKNOWN
+            }
+        } catch (_: Throwable) {
+            MediaKind.UNKNOWN
+        } finally {
+            extractor.release()
         }
     }
 
@@ -180,7 +233,8 @@ class ImportMaterialUseCase @Inject constructor(
             "mov",
             "webm",
             "m4v",
-            "3gp"
+            "3gp",
+            "qt"
         )
 
         private val SUPPORTED_MEDIA_EXTENSIONS = setOf(

@@ -1,6 +1,7 @@
 package com.orien.shadowing.domain.usecase
 
 import android.content.Context
+import android.media.MediaExtractor
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.CancellationException
 import kotlinx.serialization.encodeToString
@@ -179,11 +180,42 @@ class ImportMediaUseCase @Inject constructor(
     }
 
     private fun detectMaterialType(file: File, mimeType: String?): String {
+        val trackDetectedType = detectMaterialTypeFromTracks(file)
         return when {
+            trackDetectedType != null -> trackDetectedType
             mimeType?.startsWith("video/") == true -> "video"
             mimeType?.startsWith("audio/") == true -> "audio"
             file.extension.lowercase() in VIDEO_EXTENSIONS -> "video"
             else -> "audio"
+        }
+    }
+
+    private fun detectMaterialTypeFromTracks(file: File): String? {
+        val extractor = MediaExtractor()
+        return try {
+            extractor.setDataSource(file.absolutePath)
+            var hasAudioTrack = false
+            var hasVideoTrack = false
+            for (index in 0 until extractor.trackCount) {
+                val mime = extractor.getTrackFormat(index).getString(android.media.MediaFormat.KEY_MIME)
+                when {
+                    mime?.startsWith("video/") == true -> hasVideoTrack = true
+                    mime?.startsWith("audio/") == true -> hasAudioTrack = true
+                }
+                if (hasVideoTrack) {
+                    break
+                }
+            }
+
+            when {
+                hasVideoTrack -> "video"
+                hasAudioTrack -> "audio"
+                else -> null
+            }
+        } catch (_: Throwable) {
+            null
+        } finally {
+            extractor.release()
         }
     }
 
@@ -195,7 +227,7 @@ class ImportMediaUseCase @Inject constructor(
 
     companion object {
         const val DISPUTED_SENTENCES_FILE_NAME = "disputed_sentences.json"
-        private val VIDEO_EXTENSIONS = setOf("mp4", "mkv", "mov", "webm", "m4v", "3gp")
+        private val VIDEO_EXTENSIONS = setOf("mp4", "mkv", "mov", "webm", "m4v", "3gp", "qt")
         private val AUDIO_EXTENSIONS = setOf("mp3", "wav", "m4a", "ogg", "aac", "flac", "opus")
         private val SUPPORTED_MEDIA_EXTENSIONS = VIDEO_EXTENSIONS + AUDIO_EXTENSIONS
     }

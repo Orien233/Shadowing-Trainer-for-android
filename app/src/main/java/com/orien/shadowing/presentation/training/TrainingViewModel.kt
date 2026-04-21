@@ -1,5 +1,8 @@
 package com.orien.shadowing.presentation.training
 
+import android.media.MediaExtractor
+import android.media.MediaCodecList
+import android.media.MediaMetadataRetriever
 import android.util.Log
 import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.ViewModel
@@ -82,10 +85,12 @@ class TrainingViewModel @Inject constructor(
 
     private val _events = MutableSharedFlow<TrainingEvent>()
     val events = _events.asSharedFlow()
+    private val hasVideoTrackCache = mutableMapOf<String, Boolean>()
+    private val videoMimeSupportCache = mutableMapOf<String, Boolean>()
 
     companion object {
         private const val TAG = "TrainingViewModel"
-        private val VIDEO_EXTENSIONS = setOf("mp4", "mkv", "mov", "webm", "m4v", "3gp")
+        private val VIDEO_EXTENSIONS = setOf("mp4", "mkv", "mov", "webm", "m4v", "3gp", "qt")
     }
 
     init {
@@ -100,6 +105,12 @@ class TrainingViewModel @Inject constructor(
         viewModelScope.launch {
             audioRecorder.isRecording.collect { recording ->
                 _uiState.update { it.copy(isRecording = recording) }
+            }
+        }
+
+        viewModelScope.launch {
+            audioPlayer.playbackMessages.collect { message ->
+                _events.emit(TrainingEvent.ShowMessage(message))
             }
         }
     }
@@ -354,10 +365,13 @@ class TrainingViewModel @Inject constructor(
         val startTimeMs = sentence.startTimeMs
         val endTimeMs = sentence.endTimeMs
         val hasTimedSegment = startTimeMs != null && endTimeMs != null && endTimeMs > startTimeMs
+        val sourceHasVideo = sourcePath?.let { path ->
+            isVideoSource(path, material?.type)
+        } == true
 
         // If this material has a video source, prefer video playback over audio-only clips.
-        if (sourcePath != null && isVideoFile(sourcePath)) {
-            val videoClipPath = clipPath?.takeIf(::isVideoFile)
+        if (sourcePath != null && sourceHasVideo) {
+            val videoClipPath = clipPath?.takeIf { isVideoSource(it, material?.type) }
             if (videoClipPath != null) {
                 return PlaybackSource(
                     filePath = videoClipPath,
@@ -389,7 +403,7 @@ class TrainingViewModel @Inject constructor(
                 filePath = clipPath,
                 startTimeMs = null,
                 endTimeMs = null,
-                isVideo = isVideoFile(clipPath)
+                isVideo = isVideoSource(clipPath, material?.type)
             )
         }
 
@@ -400,22 +414,127 @@ class TrainingViewModel @Inject constructor(
                 filePath = sourcePath,
                 startTimeMs = startTimeMs,
                 endTimeMs = endTimeMs,
-                isVideo = isVideoFile(sourcePath)
+                isVideo = sourceHasVideo
             )
         } else {
             PlaybackSource(
                 filePath = sourcePath,
                 startTimeMs = null,
                 endTimeMs = null,
-                isVideo = isVideoFile(sourcePath)
+                isVideo = sourceHasVideo
             )
         }
     }
 
-    private fun isVideoFile(path: String): Boolean {
+    private fun isVideoSource(path: String, materialTypeHint: String?): Boolean {
+        val cached = hasVideoTrackCache[path]
+        if (cached != null) {
+            return cached
+        }
+
+        val detectedByTrack = detectHasVideoTrack(path)
+        if (detectedByTrack != null) {
+            hasVideoTrackCache[path] = detectedByTrack
+            return detectedByTrack
+        }
+
         val sanitizedPath = path.substringBefore('?').substringBefore('#')
         val extension = sanitizedPath.substringAfterLast('.', "").lowercase()
-        return extension in VIDEO_EXTENSIONS
+        return when {
+            materialTypeHint.equals("video", ignoreCase = true) -> true
+            materialTypeHint.equals("audio", ignoreCase = true) -> false
+            extension in VIDEO_EXTENSIONS -> true
+            else -> false
+        }
+    }
+
+    private fun detectHasVideoTrack(path: String): Boolean? {
+        if (path.startsWith("content://")) {
+            // Current training flow persists local file paths. Keep a safe fallback for content Uris.
+            return null
+        }
+
+        val localPath = if (path.startsWith("file://")) {
+            android.net.Uri.parse(path).path
+        } else {
+            path
+        } ?: return null
+
+        val extractor = MediaExtractor()
+        try {
+            extractor.setDataSource(localPath)
+            var hasAudioTrack = false
+            var hasAnyVideoTrack = false
+            var hasSupportedVideoTrack = false
+            for (index in 0 until extractor.trackCount) {
+                val mime = extractor.getTrackFormat(index).getString(android.media.MediaFormat.KEY_MIME)
+                when {
+                    mime?.startsWith("video/") == true -> {
+                        hasAnyVideoTrack = true
+                        if (isVideoMimeSupported(mime)) {
+                            hasSupportedVideoTrack = true
+                        }
+                    }
+                    mime?.startsWith("audio/") == true -> hasAudioTrack = true
+                }
+                if (hasSupportedVideoTrack) {
+                    break
+                }
+            }
+            when {
+                hasSupportedVideoTrack -> return true
+                hasAnyVideoTrack && hasAudioTrack -> return false
+                hasAnyVideoTrack -> return true
+                hasAudioTrack -> return false
+            }
+        } catch (_: Throwable) {
+            // Fall through to metadata-retriever based detection.
+        } finally {
+            runCatching { extractor.release() }
+        }
+
+        val retriever = MediaMetadataRetriever()
+        return try {
+            retriever.setDataSource(localPath)
+            val hasVideo = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_HAS_VIDEO)
+            when {
+                hasVideo.equals("yes", ignoreCase = true) -> true
+                hasVideo == "1" -> true
+                hasVideo.equals("no", ignoreCase = true) -> false
+                hasVideo == "0" -> false
+                else -> {
+                    val width =
+                        retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)
+                            ?.toIntOrNull() ?: 0
+                    val height =
+                        retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)
+                            ?.toIntOrNull() ?: 0
+                    if (width > 0 && height > 0) true else null
+                }
+            }
+        } catch (_: Throwable) {
+            null
+        } finally {
+            runCatching { retriever.release() }
+        }
+    }
+
+    private fun isVideoMimeSupported(mime: String): Boolean {
+        val cached = videoMimeSupportCache[mime]
+        if (cached != null) {
+            return cached
+        }
+        val supported = runCatching {
+            MediaCodecList(MediaCodecList.REGULAR_CODECS)
+                .codecInfos
+                .any { info ->
+                    !info.isEncoder && info.supportedTypes.any { type ->
+                        type.equals(mime, ignoreCase = true)
+                    }
+                }
+        }.getOrDefault(false)
+        videoMimeSupportCache[mime] = supported
+        return supported
     }
 
     private fun buildErrorTags(compareResult: TextCompareUseCase.CompareResult): String? {

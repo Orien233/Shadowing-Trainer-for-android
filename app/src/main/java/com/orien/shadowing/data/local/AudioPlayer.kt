@@ -1,14 +1,20 @@
 package com.orien.shadowing.data.local
 
 import android.content.Context
+import android.net.Uri
+import androidx.media3.common.C
 import androidx.media3.common.MediaItem
+import androidx.media3.common.PlaybackException
 import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
 import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -31,10 +37,15 @@ class AudioPlayer @Inject constructor(
     private val _durationMs = MutableStateFlow(0L)
     val durationMs: StateFlow<Long> = _durationMs.asStateFlow()
 
+    private val _playbackMessages = MutableSharedFlow<String>(extraBufferCapacity = 4)
+    val playbackMessages: SharedFlow<String> = _playbackMessages.asSharedFlow()
+
     private var positionUpdateRunnable: Runnable? = null
     private var segmentStartMs: Long = 0L
     private var segmentEndMs: Long? = null
     private var loopSegment: Boolean = false
+    private var currentMediaUri: Uri? = null
+    private var retriedAudioOnlyForCurrentMedia: Boolean = false
 
     fun init() {
         if (player != null) {
@@ -60,6 +71,17 @@ class AudioPlayer @Inject constructor(
                         _isPlaying.value = false
                     }
                 }
+
+                override fun onPlayerError(error: PlaybackException) {
+                    _isPlaying.value = false
+                    if (tryRecoverWithAudioOnly(this@apply)) {
+                        return
+                    }
+
+                    _playbackMessages.tryEmit(
+                        error.message ?: "Unable to play this media on this device."
+                    )
+                }
             })
         }
     }
@@ -81,12 +103,15 @@ class AudioPlayer @Inject constructor(
         segmentStartMs = startTimeMs ?: 0L
         segmentEndMs = endTimeMs
         loopSegment = loop && endTimeMs != null
+        currentMediaUri = uri
+        retriedAudioOnlyForCurrentMedia = false
 
         exoPlayer.repeatMode = if (endTimeMs == null && loop) {
             Player.REPEAT_MODE_ONE
         } else {
             Player.REPEAT_MODE_OFF
         }
+        applyVideoTrackDisabled(exoPlayer, disabled = false)
 
         exoPlayer.setMediaItem(MediaItem.fromUri(uri))
         exoPlayer.prepare()
@@ -171,6 +196,35 @@ class AudioPlayer @Inject constructor(
         segmentStartMs = 0L
         segmentEndMs = null
         loopSegment = false
+        currentMediaUri = null
+        retriedAudioOnlyForCurrentMedia = false
         player?.repeatMode = Player.REPEAT_MODE_OFF
+    }
+
+    private fun tryRecoverWithAudioOnly(exoPlayer: ExoPlayer): Boolean {
+        if (retriedAudioOnlyForCurrentMedia) {
+            return false
+        }
+        val mediaUri = currentMediaUri ?: return false
+
+        return runCatching {
+            retriedAudioOnlyForCurrentMedia = true
+            applyVideoTrackDisabled(exoPlayer, disabled = true)
+            exoPlayer.setMediaItem(MediaItem.fromUri(mediaUri))
+            exoPlayer.prepare()
+            exoPlayer.seekTo(segmentStartMs)
+            exoPlayer.playWhenReady = true
+            _playbackMessages.tryEmit(
+                "Video decoding is unsupported on this device. Switched to audio-only playback."
+            )
+            true
+        }.getOrDefault(false)
+    }
+
+    private fun applyVideoTrackDisabled(exoPlayer: ExoPlayer, disabled: Boolean) {
+        exoPlayer.trackSelectionParameters = exoPlayer.trackSelectionParameters
+            .buildUpon()
+            .setTrackTypeDisabled(C.TRACK_TYPE_VIDEO, disabled)
+            .build()
     }
 }

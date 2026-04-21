@@ -1,0 +1,312 @@
+package com.orien.shadowing.data.local
+
+import android.content.Context
+import com.orien.shadowing.data.local.moonshine.AudioUtils
+import com.orien.shadowing.data.local.moonshine.MoonshineTranscriber
+import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import java.io.File
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * On-device ASR wrapper backed by Moonshine.
+ */
+@Singleton
+class MoonshineAsr @Inject constructor(
+    @ApplicationContext private val context: Context
+) {
+    private data class ModelSpec(
+        val directory: File,
+        val arch: Int
+    )
+
+    private data class BundledModel(
+        val assetDirName: String,
+        val arch: Int
+    )
+
+    data class AsrResult(
+        val text: String,
+        val lines: List<AsrLine> = emptyList(),
+        val confidence: Float = 0f,
+        val durationMs: Long = 0L,
+        val errorMessage: String? = null
+    )
+
+    data class AsrLine(
+        val text: String,
+        val startTimeMs: Long,
+        val endTimeMs: Long
+    )
+
+    private var transcriber: MoonshineTranscriber? = null
+    private var isInitialized = false
+    private val transcriberLock = Any()
+    @Volatile
+    private var lastInitErrorMessage: String? = null
+
+    suspend fun initialize(
+        modelPath: String? = null,
+        arch: Int = MoonshineTranscriber.ARCH_MEDIUM_STREAMING
+    ): Boolean = withContext(Dispatchers.IO) {
+        synchronized(transcriberLock) {
+            initializeLocked(modelPath, arch)
+        }
+    }
+
+    suspend fun transcribe(audioPath: String): AsrResult = withContext(Dispatchers.IO) {
+        val startTime = System.currentTimeMillis()
+        synchronized(transcriberLock) {
+            if (!isInitialized) {
+                val ready = initializeLocked(
+                    modelPath = null,
+                    arch = MoonshineTranscriber.ARCH_MEDIUM_STREAMING
+                )
+                if (!ready) {
+                    return@withContext AsrResult(
+                        text = "",
+                        durationMs = System.currentTimeMillis() - startTime,
+                        errorMessage = "Moonshine model is not available."
+                    )
+                }
+            }
+
+            val loadedTranscriber = transcriber ?: return@withContext AsrResult(
+                text = "",
+                durationMs = System.currentTimeMillis() - startTime,
+                errorMessage = "Moonshine transcriber is unavailable."
+            )
+
+            try {
+                val samples = AudioUtils.readAudioAsFloat(audioPath)
+                val transcript = loadedTranscriber.transcribe(samples, AudioUtils.TARGET_SAMPLE_RATE)
+                AsrResult(
+                    text = transcript.text,
+                    lines = transcript.lines.mapNotNull { line ->
+                        val normalizedText = line.text.trim()
+                        if (normalizedText.isEmpty()) {
+                            null
+                        } else {
+                            val safeStartTimeMs = line.startTimeMs.coerceAtLeast(0L)
+                            AsrLine(
+                                text = normalizedText,
+                                startTimeMs = safeStartTimeMs,
+                                endTimeMs = line.endTimeMs.coerceAtLeast(safeStartTimeMs)
+                            )
+                        }
+                    },
+                    confidence = 1f,
+                    durationMs = System.currentTimeMillis() - startTime
+                )
+            } catch (error: Throwable) {
+                if (error is CancellationException) {
+                    throw error
+                }
+                android.util.Log.e("MoonshineAsr", "Failed to transcribe $audioPath", error)
+                AsrResult(
+                    text = "",
+                    durationMs = System.currentTimeMillis() - startTime,
+                    errorMessage = error.message ?: "Failed to process audio."
+                )
+            }
+        }
+    }
+
+    fun isReady(): Boolean = synchronized(transcriberLock) {
+        isInitialized && transcriber?.isLoaded() == true
+    }
+
+    fun release() {
+        synchronized(transcriberLock) {
+            transcriber?.release()
+            transcriber = null
+            isInitialized = false
+        }
+    }
+
+    fun isModelAvailable(modelPath: String? = null): Boolean {
+        val modelSpec = resolveModelSpec(modelPath, MoonshineTranscriber.ARCH_MEDIUM_STREAMING)
+        return hasRequiredFiles(modelSpec.directory, modelSpec.arch)
+    }
+
+    fun getLastInitErrorMessage(): String? = lastInitErrorMessage
+
+    private fun initializeLocked(
+        modelPath: String?,
+        arch: Int
+    ): Boolean {
+        if (isInitialized) {
+            lastInitErrorMessage = null
+            return true
+        }
+
+        return try {
+            val modelSpec = resolveModelSpec(modelPath, arch)
+            if (!hasRequiredFiles(modelSpec.directory, modelSpec.arch)) {
+                lastInitErrorMessage =
+                    "Missing model files in ${modelSpec.directory.absolutePath} for arch=${modelSpec.arch}"
+                android.util.Log.w(
+                    "MoonshineAsr",
+                    lastInitErrorMessage ?: "Missing model files"
+                )
+                false
+            } else {
+                val loadedTranscriber = MoonshineTranscriber()
+                loadedTranscriber.loadFromFiles(modelSpec.directory.absolutePath, modelSpec.arch)
+                transcriber = loadedTranscriber
+                isInitialized = true
+                lastInitErrorMessage = null
+
+                android.util.Log.i(
+                    "MoonshineAsr",
+                    "Loaded Moonshine model from ${modelSpec.directory.absolutePath} with arch=${modelSpec.arch}"
+                )
+                true
+            }
+        } catch (error: Throwable) {
+            if (error is CancellationException) {
+                throw error
+            }
+            android.util.Log.e("MoonshineAsr", "Failed to initialize Moonshine", error)
+            transcriber?.release()
+            transcriber = null
+            isInitialized = false
+            lastInitErrorMessage = error.message ?: "Unknown native initialization error"
+            false
+        }
+    }
+
+    private fun resolveModelSpec(modelPath: String?, requestedArch: Int): ModelSpec {
+        if (modelPath != null) {
+            val explicitDir = File(modelPath)
+            return ModelSpec(explicitDir, detectArch(explicitDir, requestedArch))
+        }
+
+        extractBundledModelIfNeeded()?.let { return it }
+
+        val filesystemCandidates = listOf(
+            ModelSpec(File(context.filesDir, "moonshine/medium-streaming-en"), MoonshineTranscriber.ARCH_MEDIUM_STREAMING),
+            ModelSpec(File(context.filesDir, "moonshine/small-streaming-en"), MoonshineTranscriber.ARCH_SMALL_STREAMING),
+            ModelSpec(File(context.filesDir, "moonshine/base-streaming-en"), MoonshineTranscriber.ARCH_BASE_STREAMING),
+            ModelSpec(File(context.filesDir, "moonshine/tiny-streaming-en"), MoonshineTranscriber.ARCH_TINY_STREAMING),
+            ModelSpec(File(context.filesDir, "moonshine/base-en"), MoonshineTranscriber.ARCH_BASE),
+            ModelSpec(File(context.filesDir, "moonshine/tiny-en"), MoonshineTranscriber.ARCH_TINY)
+        )
+
+        filesystemCandidates.firstOrNull { hasRequiredFiles(it.directory, it.arch) }?.let {
+            return it
+        }
+
+        return ModelSpec(
+            File(context.filesDir, "moonshine/${defaultDirectoryName(requestedArch)}"),
+            requestedArch
+        )
+    }
+
+    private fun extractBundledModelIfNeeded(): ModelSpec? {
+        val assetChildren = context.assets.list("moonshine")?.toSet().orEmpty()
+        val candidates = listOf(
+            BundledModel("medium-streaming-en", MoonshineTranscriber.ARCH_MEDIUM_STREAMING),
+            BundledModel("small-streaming-en", MoonshineTranscriber.ARCH_SMALL_STREAMING),
+            BundledModel("base-streaming-en", MoonshineTranscriber.ARCH_BASE_STREAMING),
+            BundledModel("tiny-streaming-en", MoonshineTranscriber.ARCH_TINY_STREAMING),
+            BundledModel("base-en", MoonshineTranscriber.ARCH_BASE),
+            BundledModel("tiny-en", MoonshineTranscriber.ARCH_TINY)
+        )
+
+        val bundled = candidates.firstOrNull { assetChildren.contains(it.assetDirName) } ?: return null
+        val outputDir = File(context.filesDir, "moonshine/${bundled.assetDirName}")
+        if (!hasRequiredFiles(outputDir, bundled.arch)) {
+            copyAssetTree("moonshine/${bundled.assetDirName}", outputDir)
+        }
+
+        return ModelSpec(outputDir, bundled.arch)
+    }
+
+    private fun copyAssetTree(assetPath: String, destination: File) {
+        val children = context.assets.list(assetPath).orEmpty()
+        if (children.isEmpty()) {
+            destination.parentFile?.mkdirs()
+            context.assets.open(assetPath).use { input ->
+                destination.outputStream().use { output ->
+                    input.copyTo(output)
+                }
+            }
+            return
+        }
+
+        destination.mkdirs()
+        children.forEach { child ->
+            copyAssetTree("$assetPath/$child", File(destination, child))
+        }
+    }
+
+    private fun hasRequiredFiles(directory: File, arch: Int): Boolean {
+        if (!directory.exists() || !directory.isDirectory) {
+            return false
+        }
+
+        return requiredFilesForArch(arch).all { required ->
+            File(directory, required).exists()
+        }
+    }
+
+    private fun requiredFilesForArch(arch: Int): List<String> {
+        return if (isStreamingArch(arch)) {
+            listOf(
+                "frontend.ort",
+                "encoder.ort",
+                "adapter.ort",
+                "cross_kv.ort",
+                "decoder_kv.ort",
+                "streaming_config.json",
+                "tokenizer.bin"
+            )
+        } else {
+            listOf("encoder_model.ort", "decoder_model_merged.ort", "tokenizer.bin")
+        }
+    }
+
+    private fun detectArch(directory: File, requestedArch: Int): Int {
+        if (hasRequiredFiles(directory, requestedArch)) {
+            return requestedArch
+        }
+
+        return when {
+            File(directory, "streaming_config.json").exists() -> when {
+                isStreamingArch(requestedArch) -> requestedArch
+                directory.name.contains("tiny", ignoreCase = true) -> MoonshineTranscriber.ARCH_TINY_STREAMING
+                directory.name.contains("base", ignoreCase = true) -> MoonshineTranscriber.ARCH_BASE_STREAMING
+                directory.name.contains("small", ignoreCase = true) -> MoonshineTranscriber.ARCH_SMALL_STREAMING
+                else -> MoonshineTranscriber.ARCH_MEDIUM_STREAMING
+            }
+
+            File(directory, "encoder_model.ort").exists() -> when {
+                requestedArch == MoonshineTranscriber.ARCH_BASE -> requestedArch
+                directory.name.contains("base", ignoreCase = true) -> MoonshineTranscriber.ARCH_BASE
+                else -> MoonshineTranscriber.ARCH_TINY
+            }
+
+            else -> requestedArch
+        }
+    }
+
+    private fun isStreamingArch(arch: Int): Boolean {
+        return arch == MoonshineTranscriber.ARCH_TINY_STREAMING ||
+            arch == MoonshineTranscriber.ARCH_BASE_STREAMING ||
+            arch == MoonshineTranscriber.ARCH_SMALL_STREAMING ||
+            arch == MoonshineTranscriber.ARCH_MEDIUM_STREAMING
+    }
+
+    private fun defaultDirectoryName(arch: Int): String = when (arch) {
+        MoonshineTranscriber.ARCH_TINY -> "tiny-en"
+        MoonshineTranscriber.ARCH_BASE -> "base-en"
+        MoonshineTranscriber.ARCH_TINY_STREAMING -> "tiny-streaming-en"
+        MoonshineTranscriber.ARCH_BASE_STREAMING -> "base-streaming-en"
+        MoonshineTranscriber.ARCH_SMALL_STREAMING -> "small-streaming-en"
+        else -> "medium-streaming-en"
+    }
+}

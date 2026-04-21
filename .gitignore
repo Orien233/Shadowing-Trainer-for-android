@@ -1,0 +1,28 @@
+# Gradle
+.gradle/
+build/
+*/build/
+
+# Local configuration
+local.properties
+.env
+.env.*
+
+# IDE
+.idea/
+*.iml
+
+# Android Studio / IntelliJ caches
+.cxx/
+.cxx*/
+*/.cxx/
+*/.cxx*/
+captures/
+externalNativeBuild/
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db

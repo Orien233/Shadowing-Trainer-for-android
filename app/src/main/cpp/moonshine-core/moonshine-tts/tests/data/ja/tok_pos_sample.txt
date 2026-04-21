@@ -1,0 +1,2 @@
+placeholder_lfs_object: 6becc36bc56d72dfff2876bcbf485c52c1b0cefe30ab36b2d7757189ada417e3
+placeholder_size: 130

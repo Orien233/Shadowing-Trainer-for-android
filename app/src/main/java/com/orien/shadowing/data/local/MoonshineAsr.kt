@@ -10,6 +10,9 @@ import kotlinx.coroutines.withContext
 import java.io.File
 import javax.inject.Inject
 import javax.inject.Singleton
+import kotlin.math.abs
+import kotlin.math.max
+import kotlin.math.min
 
 /**
  * On-device ASR wrapper backed by Moonshine.
@@ -33,6 +36,7 @@ class MoonshineAsr @Inject constructor(
         val lines: List<AsrLine> = emptyList(),
         val confidence: Float = 0f,
         val durationMs: Long = 0L,
+        val disputedLines: List<AsrLine> = emptyList(),
         val errorMessage: String? = null
     )
 
@@ -47,6 +51,15 @@ class MoonshineAsr @Inject constructor(
     private val transcriberLock = Any()
     @Volatile
     private var lastInitErrorMessage: String? = null
+
+    companion object {
+        private const val MIN_CHUNK_DURATION_MS = 20_000L
+        private const val MAX_CHUNK_DURATION_MS = 180_000L
+        private const val CHUNK_OVERLAP_MS = 2_000L
+        private const val CHUNK_HEAP_FRACTION = 0.08
+        private const val BYTES_PER_SAMPLE = 4L
+        private const val BOUNDARY_MATCH_WINDOW_MS = 3_000L
+    }
 
     suspend fun initialize(
         modelPath: String? = null,
@@ -81,26 +94,19 @@ class MoonshineAsr @Inject constructor(
             )
 
             try {
-                val samples = AudioUtils.readAudioAsFloat(audioPath)
-                val transcript = loadedTranscriber.transcribe(samples, AudioUtils.TARGET_SAMPLE_RATE)
-                AsrResult(
-                    text = transcript.text,
-                    lines = transcript.lines.mapNotNull { line ->
-                        val normalizedText = line.text.trim()
-                        if (normalizedText.isEmpty()) {
-                            null
-                        } else {
-                            val safeStartTimeMs = line.startTimeMs.coerceAtLeast(0L)
-                            AsrLine(
-                                text = normalizedText,
-                                startTimeMs = safeStartTimeMs,
-                                endTimeMs = line.endTimeMs.coerceAtLeast(safeStartTimeMs)
-                            )
-                        }
-                    },
-                    confidence = 1f,
-                    durationMs = System.currentTimeMillis() - startTime
-                )
+                val file = File(audioPath)
+                val result = if (shouldUseChunkedTranscription(file)) {
+                    transcribeInChunks(file, loadedTranscriber)
+                } else {
+                    val samples = AudioUtils.readAudioAsFloat(audioPath)
+                    val transcript = loadedTranscriber.transcribe(samples, AudioUtils.TARGET_SAMPLE_RATE)
+                    AsrResult(
+                        text = transcript.text,
+                        lines = normalizeLines(transcript.lines.asList()),
+                        confidence = 1f
+                    )
+                }
+                result.copy(durationMs = System.currentTimeMillis() - startTime)
             } catch (error: Throwable) {
                 if (error is CancellationException) {
                     throw error
@@ -113,6 +119,163 @@ class MoonshineAsr @Inject constructor(
                 )
             }
         }
+    }
+
+    private fun shouldUseChunkedTranscription(file: File): Boolean {
+        return !file.extension.equals("wav", ignoreCase = true)
+    }
+
+    private fun transcribeInChunks(
+        file: File,
+        loadedTranscriber: MoonshineTranscriber
+    ): AsrResult {
+        val totalDurationMs = AudioUtils.resolveMediaDurationMs(file.absolutePath)
+            ?.takeIf { it > 0L }
+
+        val chunkDurationMs = resolveChunkDurationMs()
+        val overlapMs = min(CHUNK_OVERLAP_MS, max(500L, chunkDurationMs / 5))
+        val stepMs = max(1L, chunkDurationMs - overlapMs)
+
+        val mergedLines = mutableListOf<AsrLine>()
+        val disputedLines = mutableListOf<AsrLine>()
+        var previousTailLines: List<AsrLine> = emptyList()
+        var chunkStartMs = 0L
+
+        while (true) {
+            val chunkEndMs = if (totalDurationMs != null) {
+                min(totalDurationMs, chunkStartMs + chunkDurationMs)
+            } else {
+                chunkStartMs + chunkDurationMs
+            }
+            val chunkSamples = AudioUtils.decodeMediaSegmentAsFloat(
+                filePath = file.absolutePath,
+                startTimeMs = chunkStartMs,
+                endTimeMs = chunkEndMs,
+                targetSampleRate = AudioUtils.TARGET_SAMPLE_RATE
+            )
+            if (chunkSamples.isEmpty()) {
+                break
+            }
+            val chunkTranscript = loadedTranscriber.transcribe(chunkSamples, AudioUtils.TARGET_SAMPLE_RATE)
+            val normalizedChunkLines = normalizeLines(chunkTranscript.lines.asList(), offsetMs = chunkStartMs)
+            if (chunkStartMs == 0L) {
+                mergedLines.addAll(normalizedChunkLines)
+            } else {
+                val leadingBoundaryEndMs = chunkStartMs + overlapMs
+                val leadingBoundaryLines = normalizedChunkLines.filter { it.startTimeMs < leadingBoundaryEndMs }
+                val regularLines = normalizedChunkLines.filterNot { it.startTimeMs < leadingBoundaryEndMs }
+                mergedLines.addAll(regularLines)
+                leadingBoundaryLines
+                    .filter { boundary ->
+                        previousTailLines.none { existing ->
+                            isLikelySameBoundaryLine(existing, boundary)
+                        }
+                    }
+                    .forEach(disputedLines::add)
+            }
+
+            previousTailLines = normalizedChunkLines.filter { line ->
+                line.startTimeMs < chunkEndMs && line.endTimeMs > chunkEndMs - overlapMs
+            }
+
+            if (totalDurationMs != null && chunkEndMs >= totalDurationMs) {
+                break
+            }
+            chunkStartMs += stepMs
+        }
+
+        val finalLines = mergeDuplicateLines(mergedLines)
+        val finalDisputed = mergeDuplicateLines(disputedLines).filter { dispute ->
+            finalLines.none { regular -> isLikelySameBoundaryLine(regular, dispute) }
+        }
+        return AsrResult(
+            text = finalLines.joinToString(" ") { it.text },
+            lines = finalLines,
+            confidence = 1f,
+            disputedLines = finalDisputed
+        )
+    }
+
+    private fun normalizeLines(
+        lines: List<MoonshineTranscriber.TranscriptLine>,
+        offsetMs: Long = 0L
+    ): List<AsrLine> {
+        return lines.mapNotNull { line ->
+            val normalizedText = line.text.trim()
+            if (normalizedText.isEmpty()) {
+                null
+            } else {
+                val safeStartTimeMs = (line.startTimeMs + offsetMs).coerceAtLeast(0L)
+                AsrLine(
+                    text = normalizedText,
+                    startTimeMs = safeStartTimeMs,
+                    endTimeMs = (line.endTimeMs + offsetMs).coerceAtLeast(safeStartTimeMs)
+                )
+            }
+        }.sortedBy { it.startTimeMs }
+    }
+
+    private fun mergeDuplicateLines(lines: List<AsrLine>): List<AsrLine> {
+        if (lines.isEmpty()) {
+            return emptyList()
+        }
+
+        val merged = mutableListOf<AsrLine>()
+        lines.sortedBy { it.startTimeMs }.forEach { candidate ->
+            val safeStart = candidate.startTimeMs.coerceAtLeast(0L)
+            val safeCandidate = candidate.copy(
+                startTimeMs = safeStart,
+                endTimeMs = candidate.endTimeMs.coerceAtLeast(safeStart)
+            )
+            val last = merged.lastOrNull()
+            if (last != null && isLikelySameBoundaryLine(last, safeCandidate)) {
+                merged[merged.lastIndex] = last.copy(
+                    text = if (last.text.length >= safeCandidate.text.length) last.text else safeCandidate.text,
+                    startTimeMs = min(last.startTimeMs, safeCandidate.startTimeMs),
+                    endTimeMs = max(last.endTimeMs, safeCandidate.endTimeMs)
+                )
+            } else {
+                merged.add(safeCandidate)
+            }
+        }
+        return merged
+    }
+
+    private fun isLikelySameBoundaryLine(first: AsrLine, second: AsrLine): Boolean {
+        val firstText = normalizeTextForBoundaryMatch(first.text)
+        val secondText = normalizeTextForBoundaryMatch(second.text)
+        if (firstText.isEmpty() || secondText.isEmpty()) {
+            return false
+        }
+
+        val sameText =
+            firstText == secondText || firstText.contains(secondText) || secondText.contains(firstText)
+        val closeInTime = abs(first.startTimeMs - second.startTimeMs) <= BOUNDARY_MATCH_WINDOW_MS
+        val overlapsInTime =
+            first.startTimeMs <= second.endTimeMs && second.startTimeMs <= first.endTimeMs
+        return sameText && (closeInTime || overlapsInTime)
+    }
+
+    private fun normalizeTextForBoundaryMatch(text: String): String {
+        return text.lowercase()
+            .replace(Regex("[^\\p{L}\\p{N}\\s]"), " ")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+    }
+
+    private fun resolveChunkDurationMs(): Long {
+        val maxHeapBytes = Runtime.getRuntime().maxMemory()
+        if (maxHeapBytes <= 0L) {
+            return 60_000L
+        }
+
+        val chunkBudgetBytes = (maxHeapBytes * CHUNK_HEAP_FRACTION).toLong()
+        val targetBytesPerSecond = AudioUtils.TARGET_SAMPLE_RATE.toLong() * BYTES_PER_SAMPLE
+        val chunkSeconds = (chunkBudgetBytes / targetBytesPerSecond).coerceIn(
+            MIN_CHUNK_DURATION_MS / 1000L,
+            MAX_CHUNK_DURATION_MS / 1000L
+        )
+        return chunkSeconds * 1000L
     }
 
     fun isReady(): Boolean = synchronized(transcriberLock) {

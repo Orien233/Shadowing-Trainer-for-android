@@ -80,6 +80,11 @@ class ImportMaterialUseCase @Inject constructor(
         val sourcePath = sourceMedia?.let { mediaFile ->
             copyFile(mediaFile, File(materialDir, mediaFile.name)).absolutePath
         }
+        copyOptionalFile(
+            sourceRoot = packageDir,
+            targetRoot = materialDir,
+            relativePath = ImportMediaUseCase.DISPUTED_SENTENCES_FILE_NAME
+        )
 
         if (sourcePath != null) {
             materialRepository.getMaterial(materialId)?.let { material ->
@@ -125,6 +130,14 @@ class ImportMaterialUseCase @Inject constructor(
         target.parentFile?.mkdirs()
         source.copyTo(target, overwrite = true)
         return target
+    }
+
+    private fun copyOptionalFile(sourceRoot: File, targetRoot: File, relativePath: String): File? {
+        val sourceFile = File(sourceRoot, relativePath)
+        if (!sourceFile.exists() || !sourceFile.isFile) {
+            return null
+        }
+        return copyFile(sourceFile, File(targetRoot, relativePath))
     }
 
     private fun selectPrimaryMediaFile(candidates: List<File>, declaredType: String): File? {

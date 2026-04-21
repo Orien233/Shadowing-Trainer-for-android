@@ -13,6 +13,7 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import kotlin.math.ceil
 import kotlin.math.max
+import kotlin.math.min
 
 /**
  * Converts different audio formats into the mono 16kHz float samples Moonshine expects.
@@ -23,6 +24,10 @@ object AudioUtils {
     private const val MAX_ASR_DURATION_MS = MAX_ASR_DURATION_MINUTES * 60 * 1000L
     private const val MAX_TARGET_SAMPLE_COUNT =
         TARGET_SAMPLE_RATE * 60L * MAX_ASR_DURATION_MINUTES
+    private const val BYTES_PER_FLOAT = 4L
+    private const val MIN_RUNTIME_HEADROOM_BYTES = 32L * 1024L * 1024L
+    private const val MAX_AUDIO_BUFFER_HEAP_FRACTION = 0.2
+    private const val MIN_DEVICE_SAFE_DURATION_MINUTES = 2L
 
     fun readAudioAsFloat(filePath: String, targetSampleRate: Int = TARGET_SAMPLE_RATE): FloatArray {
         val inputFile = File(filePath)
@@ -31,6 +36,55 @@ object AudioUtils {
         return when (inputFile.extension.lowercase()) {
             "wav" -> readWavAsFloat(inputFile, targetSampleRate)
             else -> decodeMediaToFloat(inputFile, targetSampleRate)
+        }
+    }
+
+    fun decodeMediaSegmentAsFloat(
+        filePath: String,
+        startTimeMs: Long,
+        endTimeMs: Long,
+        targetSampleRate: Int = TARGET_SAMPLE_RATE
+    ): FloatArray {
+        require(endTimeMs > startTimeMs) { "Invalid media segment range: [$startTimeMs, $endTimeMs)" }
+
+        val inputFile = File(filePath)
+        require(inputFile.exists()) { "Audio file not found: $filePath" }
+
+        return when (inputFile.extension.lowercase()) {
+            // Keep WAV handling simple; raw-media imports are typically video/audio containers.
+            "wav" -> {
+                val full = readWavAsFloat(inputFile, targetSampleRate)
+                val startIndex = ((startTimeMs * targetSampleRate) / 1000L).toInt().coerceAtLeast(0)
+                val endIndex = ((endTimeMs * targetSampleRate) / 1000L).toInt().coerceAtMost(full.size)
+                if (endIndex <= startIndex) {
+                    FloatArray(0)
+                } else {
+                    full.copyOfRange(startIndex, endIndex)
+                }
+            }
+
+            else -> decodeMediaRangeToFloat(
+                file = inputFile,
+                targetSampleRate = targetSampleRate,
+                startTimeMs = startTimeMs,
+                endTimeMs = endTimeMs,
+                enforceDurationLimit = false
+            )
+        }
+    }
+
+    fun resolveMediaDurationMs(filePath: String): Long? {
+        val file = File(filePath)
+        if (!file.exists()) {
+            return null
+        }
+
+        val retriever = MediaMetadataRetriever()
+        return try {
+            retriever.setDataSource(file.absolutePath)
+            retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull()
+        } finally {
+            runCatching { retriever.release() }
         }
     }
 
@@ -73,32 +127,42 @@ object AudioUtils {
     }
 
     private fun decodeMediaToFloat(file: File, targetSampleRate: Int): FloatArray {
+        return decodeMediaRangeToFloat(
+            file = file,
+            targetSampleRate = targetSampleRate,
+            startTimeMs = null,
+            endTimeMs = null,
+            enforceDurationLimit = true
+        )
+    }
+
+    private fun decodeMediaRangeToFloat(
+        file: File,
+        targetSampleRate: Int,
+        startTimeMs: Long?,
+        endTimeMs: Long?,
+        enforceDurationLimit: Boolean
+    ): FloatArray {
         val extractor = MediaExtractor()
         extractor.setDataSource(file.absolutePath)
 
         var codec: MediaCodec? = null
         try {
-            var audioTrackIndex = -1
-            var inputFormat: MediaFormat? = null
-            for (index in 0 until extractor.trackCount) {
-                val trackFormat = extractor.getTrackFormat(index)
-                val mime = trackFormat.getString(MediaFormat.KEY_MIME)
-                if (mime?.startsWith("audio/") == true) {
-                    audioTrackIndex = index
-                    inputFormat = trackFormat
-                    break
-                }
-            }
-
-            if (audioTrackIndex < 0 || inputFormat == null) {
-                throw IllegalArgumentException("No audio track found in ${file.name}")
-            }
+            val (audioTrackIndex, inputFormat) = selectAudioTrack(extractor, file)
 
             extractor.selectTrack(audioTrackIndex)
-            ensureDurationWithinLimit(
-                durationMs = resolveDurationMs(file, inputFormat),
-                fileName = file.name
-            )
+            if (enforceDurationLimit) {
+                ensureDurationWithinLimit(
+                    durationMs = resolveDurationMs(file, inputFormat),
+                    fileName = file.name
+                )
+            }
+
+            val rangeStartUs = startTimeMs?.coerceAtLeast(0L)?.times(1000L)
+            val rangeEndUs = endTimeMs?.coerceAtLeast(0L)?.times(1000L)
+            if (rangeStartUs != null) {
+                extractor.seekTo(rangeStartUs, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
+            }
 
             val mime = inputFormat.getString(MediaFormat.KEY_MIME)
                 ?: throw IllegalArgumentException("Missing audio mime type in ${file.name}")
@@ -123,8 +187,11 @@ object AudioUtils {
                             ?: throw IllegalStateException("Input buffer unavailable")
                         inputBuffer.clear()
 
+                        val sampleTimeUs = extractor.sampleTime
                         val sampleSize = extractor.readSampleData(inputBuffer, 0)
-                        if (sampleSize < 0) {
+                        val isEndOfRange =
+                            rangeEndUs != null && sampleTimeUs >= 0L && sampleTimeUs >= rangeEndUs
+                        if (sampleSize < 0 || isEndOfRange) {
                             codec.queueInputBuffer(
                                 inputIndex,
                                 0,
@@ -138,7 +205,7 @@ object AudioUtils {
                                 inputIndex,
                                 0,
                                 sampleSize,
-                                extractor.sampleTime,
+                                max(0L, sampleTimeUs),
                                 0
                             )
                             extractor.advance()
@@ -164,17 +231,33 @@ object AudioUtils {
 
                     else -> if (outputIndex >= 0) {
                         if (bufferInfo.size > 0) {
-                            val outputBuffer = codec.getOutputBuffer(outputIndex)
-                                ?: throw IllegalStateException("Output buffer unavailable")
-                            val decodedChunk =
-                                decodeOutputChunk(outputBuffer, bufferInfo, pcmEncoding, channelCount)
-                            decodedSamples.append(decodedChunk)
-                            ensureSampleCountWithinLimit(
-                                sampleCount = decodedSamples.size.toLong(),
-                                sourceRate = sampleRate,
-                                targetRate = targetSampleRate,
-                                fileName = file.name
-                            )
+                            val presentationTimeUs = bufferInfo.presentationTimeUs
+                            val shouldSkipBeforeStart =
+                                rangeStartUs != null &&
+                                    presentationTimeUs >= 0L &&
+                                    presentationTimeUs < rangeStartUs
+                            val shouldStopAtEnd =
+                                rangeEndUs != null &&
+                                    presentationTimeUs >= 0L &&
+                                    presentationTimeUs >= rangeEndUs
+
+                            if (!shouldSkipBeforeStart && !shouldStopAtEnd) {
+                                val outputBuffer = codec.getOutputBuffer(outputIndex)
+                                    ?: throw IllegalStateException("Output buffer unavailable")
+                                val decodedChunk =
+                                    decodeOutputChunk(outputBuffer, bufferInfo, pcmEncoding, channelCount)
+                                decodedSamples.append(decodedChunk)
+                                ensureSampleCountWithinLimit(
+                                    sampleCount = decodedSamples.size.toLong(),
+                                    sourceRate = sampleRate,
+                                    targetRate = targetSampleRate,
+                                    fileName = file.name
+                                )
+                            }
+
+                            if (shouldStopAtEnd) {
+                                outputDone = true
+                            }
                         }
                         codec.releaseOutputBuffer(outputIndex, false)
 
@@ -191,13 +274,26 @@ object AudioUtils {
             } else {
                 monoSamples
             }
-            ensureTargetSampleCountWithinLimit(normalizedSamples.size.toLong(), file.name)
+            if (enforceDurationLimit) {
+                ensureTargetSampleCountWithinLimit(normalizedSamples.size.toLong(), file.name)
+            }
             return normalizedSamples
         } finally {
             runCatching { codec?.stop() }
             runCatching { codec?.release() }
             extractor.release()
         }
+    }
+
+    private fun selectAudioTrack(extractor: MediaExtractor, file: File): Pair<Int, MediaFormat> {
+        for (index in 0 until extractor.trackCount) {
+            val trackFormat = extractor.getTrackFormat(index)
+            val mime = trackFormat.getString(MediaFormat.KEY_MIME)
+            if (mime?.startsWith("audio/") == true) {
+                return index to trackFormat
+            }
+        }
+        throw IllegalArgumentException("No audio track found in ${file.name}")
     }
 
     private fun decodeOutputChunk(
@@ -340,12 +436,36 @@ object AudioUtils {
     }
 
     private fun ensureTargetSampleCountWithinLimit(sampleCount: Long, fileName: String) {
-        if (sampleCount > MAX_TARGET_SAMPLE_COUNT) {
+        val effectiveLimit = resolveEffectiveSampleLimit()
+        if (sampleCount > effectiveLimit) {
+            val effectiveMinutes = max(1L, effectiveLimit / TARGET_SAMPLE_RATE / 60L)
             throw IllegalArgumentException(
                 "$fileName is too large for on-device analysis. " +
-                    "Split the media into clips under ${MAX_ASR_DURATION_MS / 60_000} minutes."
+                    "Split the media into clips under ${effectiveMinutes} minutes on this device."
             )
         }
+    }
+
+    private fun resolveEffectiveSampleLimit(): Long {
+        val maxHeapBytes = Runtime.getRuntime().maxMemory()
+        if (maxHeapBytes <= 0L) {
+            return MAX_TARGET_SAMPLE_COUNT
+        }
+
+        val usableHeapBytes = (maxHeapBytes - MIN_RUNTIME_HEADROOM_BYTES).coerceAtLeast(0L)
+        if (usableHeapBytes == 0L) {
+            return min(
+                MAX_TARGET_SAMPLE_COUNT,
+                TARGET_SAMPLE_RATE * 60L * MIN_DEVICE_SAFE_DURATION_MINUTES
+            )
+        }
+
+        // Audio decode/resample/transcribe can temporarily hold multiple large float buffers.
+        val heapBudgetForAudio = (usableHeapBytes * MAX_AUDIO_BUFFER_HEAP_FRACTION).toLong()
+        val runtimeSafeLimit = (heapBudgetForAudio / BYTES_PER_FLOAT).coerceAtLeast(
+            TARGET_SAMPLE_RATE * 60L * MIN_DEVICE_SAFE_DURATION_MINUTES
+        )
+        return min(MAX_TARGET_SAMPLE_COUNT, runtimeSafeLimit)
     }
 
     private fun sampleCountFromBytes(dataSize: Int, bitsPerSample: Int, numChannels: Int): Long {

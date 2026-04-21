@@ -65,7 +65,10 @@ class ImportMediaUseCase @Inject constructor(
             }
             val transcriptLines = transcript.lines.filter { line ->
                 line.text.isNotBlank() && line.endTimeMs > line.startTimeMs
-            }
+            }.sortedBy { it.startTimeMs }
+            val disputedLines = transcript.disputedLines.filter { line ->
+                line.text.isNotBlank() && line.endTimeMs > line.startTimeMs
+            }.sortedBy { it.startTimeMs }
 
             if (transcriptLines.isEmpty()) {
                 return ImportMaterialUseCase.ImportResult.Error(
@@ -80,6 +83,9 @@ class ImportMediaUseCase @Inject constructor(
                 language = "en"
             )
             writeSentencesJson(packageDir, transcriptLines)
+            if (disputedLines.isNotEmpty()) {
+                writeDisputedSentencesJson(packageDir, disputedLines)
+            }
 
             return importMaterialUseCase.importFromDirectory(packageDir)
         } catch (error: Throwable) {
@@ -129,6 +135,27 @@ class ImportMediaUseCase @Inject constructor(
         )
     }
 
+    private fun writeDisputedSentencesJson(
+        packageDir: File,
+        lines: List<com.orien.shadowing.data.local.MoonshineAsr.AsrLine>
+    ) {
+        val sentenceArray = buildJsonArray {
+            lines.forEachIndexed { index, line ->
+                add(
+                    buildJsonObject {
+                        put("index", index)
+                        put("textOriginal", line.text)
+                        put("startTimeMs", line.startTimeMs)
+                        put("endTimeMs", line.endTimeMs)
+                    }
+                )
+            }
+        }
+        File(packageDir, DISPUTED_SENTENCES_FILE_NAME).writeText(
+            Json.encodeToString(JsonArray.serializer(), sentenceArray)
+        )
+    }
+
     private fun buildMaterialTitle(displayName: String): String {
         val baseName = displayName.substringBeforeLast('.', displayName).trim()
         val normalized = baseName.replace(Regex("[_\\-]+"), " ").trim()
@@ -167,6 +194,7 @@ class ImportMediaUseCase @Inject constructor(
     }
 
     companion object {
+        const val DISPUTED_SENTENCES_FILE_NAME = "disputed_sentences.json"
         private val VIDEO_EXTENSIONS = setOf("mp4", "mkv", "mov", "webm", "m4v", "3gp")
         private val AUDIO_EXTENSIONS = setOf("mp3", "wav", "m4a", "ogg", "aac", "flac", "opus")
         private val SUPPORTED_MEDIA_EXTENSIONS = VIDEO_EXTENSIONS + AUDIO_EXTENSIONS

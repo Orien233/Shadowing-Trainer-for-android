@@ -59,6 +59,19 @@ class MoonshineAsr @Inject constructor(
         private const val CHUNK_HEAP_FRACTION = 0.08
         private const val BYTES_PER_SAMPLE = 4L
         private const val BOUNDARY_MATCH_WINDOW_MS = 3_000L
+        private const val SMALL_PAUSE_PROTECTION_MS = 650L
+        private const val HARD_BOUNDARY_MIN_GAP_MS = 250L
+        private const val MAX_MERGED_SENTENCE_SPAN_MS = 25_000L
+        private const val SHORT_FRAGMENT_CHAR_THRESHOLD = 12
+        private val TERMINAL_PUNCTUATION = setOf('.', '!', '?', '。', '！', '？', ';', '；', '…')
+        private val CONTINUATION_WORDS = setOf(
+            "and", "but", "or", "so", "because", "if", "when", "while",
+            "then", "that", "to", "of", "for", "with", "in", "on", "at",
+            "from", "by", "as", "also"
+        )
+        private val CONTINUATION_PREFIXES = setOf(
+            "然后", "但是", "因为", "所以", "并且", "而且", "如果", "当", "同时", "此外"
+        )
     }
 
     suspend fun initialize(
@@ -100,9 +113,12 @@ class MoonshineAsr @Inject constructor(
                 } else {
                     val samples = AudioUtils.readAudioAsFloat(audioPath)
                     val transcript = loadedTranscriber.transcribe(samples, AudioUtils.TARGET_SAMPLE_RATE)
+                    val normalizedLines = applySmallPauseProtection(
+                        normalizeLines(transcript.lines.asList())
+                    )
                     AsrResult(
-                        text = transcript.text,
-                        lines = normalizeLines(transcript.lines.asList()),
+                        text = normalizedLines.joinToString(" ") { it.text },
+                        lines = normalizedLines,
                         confidence = 1f
                     )
                 }
@@ -184,8 +200,8 @@ class MoonshineAsr @Inject constructor(
             chunkStartMs += stepMs
         }
 
-        val finalLines = mergeDuplicateLines(mergedLines)
-        val finalDisputed = mergeDuplicateLines(disputedLines).filter { dispute ->
+        val finalLines = applySmallPauseProtection(mergeDuplicateLines(mergedLines))
+        val finalDisputed = applySmallPauseProtection(mergeDuplicateLines(disputedLines)).filter { dispute ->
             finalLines.none { regular -> isLikelySameBoundaryLine(regular, dispute) }
         }
         return AsrResult(
@@ -239,6 +255,111 @@ class MoonshineAsr @Inject constructor(
             }
         }
         return merged
+    }
+
+    private fun applySmallPauseProtection(lines: List<AsrLine>): List<AsrLine> {
+        if (lines.size < 2) {
+            return lines
+        }
+
+        val merged = mutableListOf<AsrLine>()
+        lines.sortedBy { it.startTimeMs }.forEach { current ->
+            val safeCurrent = current.copy(
+                startTimeMs = current.startTimeMs.coerceAtLeast(0L),
+                endTimeMs = current.endTimeMs.coerceAtLeast(current.startTimeMs.coerceAtLeast(0L))
+            )
+            val previous = merged.lastOrNull()
+            if (previous != null && shouldMergeBySmallPause(previous, safeCurrent)) {
+                merged[merged.lastIndex] = mergeLines(previous, safeCurrent)
+            } else {
+                merged.add(safeCurrent)
+            }
+        }
+        return merged
+    }
+
+    private fun shouldMergeBySmallPause(previous: AsrLine, current: AsrLine): Boolean {
+        val pauseGapMs = current.startTimeMs - previous.endTimeMs
+        if (pauseGapMs > SMALL_PAUSE_PROTECTION_MS) {
+            return false
+        }
+        if (current.endTimeMs - previous.startTimeMs > MAX_MERGED_SENTENCE_SPAN_MS) {
+            return false
+        }
+
+        val previousText = previous.text.trim()
+        val currentText = current.text.trim()
+        if (previousText.isEmpty() || currentText.isEmpty()) {
+            return false
+        }
+
+        val previousEndsSentence = previousText.lastOrNull() in TERMINAL_PUNCTUATION
+        val currentStartsContinuation = startsWithContinuation(currentText)
+        val hasShortFragment =
+            previousText.length <= SHORT_FRAGMENT_CHAR_THRESHOLD ||
+                currentText.length <= SHORT_FRAGMENT_CHAR_THRESHOLD
+
+        if (previousEndsSentence && !currentStartsContinuation && pauseGapMs >= HARD_BOUNDARY_MIN_GAP_MS) {
+            return false
+        }
+
+        if (hasShortFragment || currentStartsContinuation) {
+            return true
+        }
+
+        return !previousEndsSentence
+    }
+
+    private fun mergeLines(previous: AsrLine, current: AsrLine): AsrLine {
+        val previousText = previous.text.trim()
+        val currentText = current.text.trim()
+        val mergedText = if (previousText.isEmpty()) {
+            currentText
+        } else if (currentText.isEmpty()) {
+            previousText
+        } else {
+            val separator = if (shouldInsertSpaceBetween(previousText, currentText)) " " else ""
+            previousText + separator + currentText
+        }
+        return AsrLine(
+            text = mergedText,
+            startTimeMs = min(previous.startTimeMs, current.startTimeMs),
+            endTimeMs = max(previous.endTimeMs, current.endTimeMs)
+        )
+    }
+
+    private fun startsWithContinuation(text: String): Boolean {
+        val normalized = text.trim()
+        if (normalized.isEmpty()) {
+            return false
+        }
+        val firstWord = normalized.lowercase().split(Regex("\\s+")).firstOrNull().orEmpty()
+        if (firstWord in CONTINUATION_WORDS) {
+            return true
+        }
+        return CONTINUATION_PREFIXES.any { normalized.startsWith(it) }
+    }
+
+    private fun shouldInsertSpaceBetween(left: String, right: String): Boolean {
+        val leftLast = left.lastOrNull() ?: return false
+        val rightFirst = right.firstOrNull() ?: return false
+        if (!leftLast.isLetterOrDigit() || !rightFirst.isLetterOrDigit()) {
+            return false
+        }
+        if (isCjk(leftLast) || isCjk(rightFirst)) {
+            return false
+        }
+        return true
+    }
+
+    private fun isCjk(char: Char): Boolean {
+        return when (Character.UnicodeScript.of(char.code)) {
+            Character.UnicodeScript.HAN,
+            Character.UnicodeScript.HIRAGANA,
+            Character.UnicodeScript.KATAKANA,
+            Character.UnicodeScript.HANGUL -> true
+            else -> false
+        }
     }
 
     private fun isLikelySameBoundaryLine(first: AsrLine, second: AsrLine): Boolean {

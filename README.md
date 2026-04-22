@@ -1,136 +1,101 @@
 # Shadowing Trainer for Android
 
-一个**本地优先**的英语 Shadowing（跟读）训练应用，使用 **Jetpack Compose + Room + Moonshine ASR** 构建，完整闭环在 Android 端完成：
+一个本地优先的英语 Shadowing 训练应用。当前仓库已经是完整的 Android 单体工程，不依赖 Web 前端或 Python 后端；素材导入、播放、录音、转写、比对和结果保存都在设备端完成。
 
-> 导入素材 → 自动/手动生成句子 → 逐句播放 → 录音 → 本地转写 → 文本比对评分 → 保存历史结果
+## 项目现状
 
----
+当前代码已经实现的主流程：
 
-## 1. 项目现状（与代码一致）
+- 素材列表
+  - 展示所有素材
+  - 重命名、删除素材
+  - 显示导入队列和失败任务
+- 三种导入方式
+  - 导入素材包目录：读取 `meta.json` 和 `sentences.json`
+  - 导入单个音频/视频文件：先用 Moonshine 在本地转写，再自动生成素材包并导入
+  - 一键导入 Demo 素材：生成 3 组示例课程
+- 句子列表
+  - 展示原文和可选注释 `textZh`
+  - 展示每句最近一次识别文本和分数
+- 训练页
+  - 逐句播放音频或视频
+  - 支持变速播放：`0.5x / 0.75x / 1.0x / 1.25x / 1.5x`
+  - 支持单句循环
+  - 支持上一句 / 下一句跳转
+  - 麦克风录音
+  - 对当前录音做本地 ASR 转写
+  - 基于文本对齐输出漏词、增词、替换词和简短反馈
+  - 基于内置 G2P 字典输出单词级 IPA 和发音提示
+  - 支持回放本次练习录音
+- 本地持久化
+  - Room 保存素材、句子、练习记录和句子最新结果
+  - 素材文件持久化到应用私有目录
 
-当前仓库已经是 Android 单端工程，不再依赖原来的 Web + Python 后端架构。
+## 目前使用的技术栈
 
-### 已实现核心能力
+- UI：Jetpack Compose + Material 3
+- 状态管理：ViewModel + StateFlow
+- 依赖注入：Hilt
+- 数据库：Room
+- 媒体播放：`MediaPlayer`
+- 录音：`AudioRecord`，16kHz / mono / PCM16 WAV
+- ASR：Moonshine（JNI + C++ + ONNX Runtime，本地推理）
+- 发音提示：内置英文 G2P 字典 `app/src/main/assets/dictionary/base_g2p_dict.json`
+- 构建：AGP `8.7.3`，Kotlin `2.1.0`，Java `17`
 
-- 素材列表：展示、重命名、删除素材。
-- 三种导入方式：
-<<<<<<< HEAD
-    - 导入素材包目录（`meta.json` + `sentences.json` + 可选媒体/clip）
-    - 导入单个音/视频文件（调用 Moonshine 自动转写并切句）
-    - 一键导入 Demo 素材
-=======
-  - 导入素材包目录（`meta.json` + `sentences.json` + 可选媒体/clip）
-  - 导入单个音/视频文件（调用 Moonshine 自动转写并切句）
-  - 一键导入 Demo 素材
->>>>>>> 9ec53416b4202d2efab5c5de13087687f9483509
-- 句子列表：展示每句文本与最近一次成绩。
-- 训练页：逐句播放、变速、循环、上下句切换。
-- 录音评估：麦克风录音（WAV）→ Moonshine 本地转写 → 词级比对评分。
-- 结果存储：保存练习记录并回填句级 latest result。
-- 视频播放：当素材为视频时，训练页使用 ExoPlayer 视频面板播放。
+## 与旧 README 不一致的地方
 
----
+这几个点已经按当前代码修正：
 
-## 2. 技术栈
+- 播放器不是 ExoPlayer，当前实现是 `MediaPlayer`
+- 默认模型不是 `tiny-en`，仓库实际内置的是 `app/src/main/assets/moonshine/medium-streaming-en`
+- 训练页不只是文本比对，还包含基于 G2P 的单词级发音提示
+- 仓库当前没有提交 `gradlew` / `gradlew.bat`
 
-- **UI**: Jetpack Compose + Material 3
-- **架构**: ViewModel + StateFlow + Repository + UseCase
-- **依赖注入**: Hilt
-- **本地数据库**: Room
-- **播放**: Media3 ExoPlayer
-- **录音**: AudioRecord（16kHz, mono, PCM16 WAV）
-- **ASR**: Moonshine（JNI + C++ + ONNX Runtime，本地推理）
-- **最低系统**: Android 8.0 (API 26)
-- **构建**: AGP 8.7.3, Kotlin 2.1.0, Java 17, NDK + CMake
+## 快速开始
 
----
+### 环境要求
 
-## 3. 页面与流程
+- Android Studio 新版本
+- Android SDK 35
+- JDK 17
+- NDK `27.0.12077973`
+- CMake `3.22.1`
+- 真机或模拟器建议使用 `arm64-v8a`
 
-### 3.1 MaterialList（素材列表）
+### 构建与运行
 
-入口页支持：
-- 查看所有素材
-- 点击进入句子列表
-- 底部弹窗执行导入（目录 / 媒体文件 / Demo）
-- 素材重命名、删除
+推荐直接用 Android Studio：
 
-### 3.2 SentenceList（句子列表）
+1. 打开仓库根目录
+2. Sync Gradle
+3. 运行 `app` 模块
 
-- 展示句子原文、可选注释（`textZh`）
-- 展示每句最近一次识别文本与分数
-- 点击进入训练页
+注意：
 
-### 3.3 Training（训练页）
+- 当前 `minSdk = 26`，`targetSdk = 35`
+- `abiFilters` 只包含 `arm64-v8a`
+- 仓库未提交 `gradlew` / `gradlew.bat`，如果要命令行构建，需要本机自行安装 Gradle
+- 当前仓库已经带有 Moonshine C++ 核心和 `medium-streaming-en` 模型资源，通常不需要额外下载模型
 
-- 目标句展示
-- 音频/视频播放，支持 `0.5x / 0.75x / 1.0x / 1.25x / 1.5x`
-- 单句循环播放
-- 录音开始/停止/取消
-- 本地 ASR 转写
-- 对比结果展示：得分、漏词、增词、错词、简评
-- 上一句/下一句导航
+## 导入方式
 
----
+### 1. 导入素材包目录
 
-## 4. 数据模型（Room）
-
-### `materials`
-
-- `id` 主键
-- `title`
-- `type`（`audio` / `video`）
-- `sourcePath`（整段媒体）
-- `coverPath`（暂未实际使用）
-- `language`
-- `createdAt`, `updatedAt`
-
-### `sentences`
-
-- `id` 主键
-- `materialId`（FK）
-- `index`
-- `textOriginal`
-- `textZh`（可空）
-- `startTimeMs`, `endTimeMs`（可空）
-- `clipPath`（可空）
-- `createdAt`
-
-### `practice_records`
-
-- `id` 主键
-- `materialId`, `sentenceId`（FK）
-- `recordingPath`
-- `recognizedText`
-- `matchScore`
-- `errorTags`（JSON）
-- `createdAt`
-
-### `sentence_latest_results`
-
-- `sentenceId` 主键（FK）
-- `latestPracticeRecordId`
-- `latestRecognizedText`
-- `latestScore`
-- `updatedAt`
-
----
-
-## 5. 导入格式说明
-
-### 5.1 素材包目录导入
-
-目录至少包含：
+素材包最少需要：
 
 ```text
 my_material/
-├── meta.json
-└── sentences.json
+|- meta.json
+|- sentences.json
 ```
 
-可选包含：
-- 根目录媒体文件（如 `source.mp3` / `source.mp4`）
-- 句级 clip 文件（在 `sentences.json` 中通过 `clipFile` 相对路径引用）
+可选内容：
+
+- 根目录媒体文件，例如 `source.mp3`、`source.mp4`
+- 句子级 clip 文件，例如 `clips/s0.wav`
+- 兼容回退音频 `fallback_audio.wav`
+- 原始媒体自动切句时生成的 `disputed_sentences.json`
 
 `meta.json` 示例：
 
@@ -157,144 +122,180 @@ my_material/
 ]
 ```
 
-### 5.2 单媒体文件导入
+字段说明：
 
-支持选择音频或视频文件。
+- `textOriginal`：训练目标文本
+- `textZh`：可选备注或中文释义
+- `startTimeMs` / `endTimeMs`：在整段媒体中的时间片段
+- `clipFile`：可选，指向句子级媒体片段
 
-流程：
-1. 复制到缓存目录
-2. 调用 Moonshine 转写
-3. 按转写行生成 `sentences.json`
-4. 复用素材包导入逻辑落库
+### 2. 导入单个音频/视频文件
 
----
+应用会通过系统文件选择器读取媒体，然后执行：
 
-## 6. 播放策略
+1. 复制到应用缓存目录
+2. 初始化 Moonshine 模型
+3. 本地转写并按时间切分句子
+4. 自动生成 `meta.json` / `sentences.json`
+5. 复用素材包导入流程完成入库
 
-训练页按以下优先级选择播放源：
+说明：
 
-1. 如果素材是视频：优先使用视频源（clip 为视频则优先 clip）
-2. 否则如果句子有 `clipPath`：直接播 clip
-3. 否则播放素材 `sourcePath`，若有时间戳则按片段播放
-4. 无可用媒体则提示不可播放
+- 导入原始媒体时，语言当前固定写入为 `en`
+- 导入队列最多并发处理 2 个任务
+- 导入通过 SAF 完成，应用会保存读取授权
 
----
+### 3. 导入 Demo 素材
 
-## 7. 文本比对策略（当前评分）
+会自动生成 3 组演示课：
 
-`TextCompareUseCase` 使用轻量词级编辑距离对齐（Match/Replace/Delete/Insert）：
+- `Lesson 1 - Greetings`
+- `Lesson 2 - Daily Routine`
+- `Lesson 3 - Meeting Phrases`
 
-- `matchScore = matchedWords / targetWords`
-- 输出：
-<<<<<<< HEAD
-    - `missedWords`
-    - `extraWords`
-    - `wrongWords`
-    - `simpleFeedback`
-=======
-  - `missedWords`
-  - `extraWords`
-  - `wrongWords`
-  - `simpleFeedback`
->>>>>>> 9ec53416b4202d2efab5c5de13087687f9483509
+## 播放与兼容策略
 
-这是第一阶段“可用优先”的实现，不做音素级/声学级评分。
+训练页会按下面的优先级选择播放源：
 
----
+1. 如果素材主媒体是视频，优先播放视频源
+2. 否则如果句子有 `clipPath`，优先播放句子级 clip
+3. 否则播放素材主媒体，并按 `startTimeMs` / `endTimeMs` 做片段播放
 
-## 8. 本地存储约定
+为了兼容不同设备的媒体解码能力，导入视频时还会按需生成：
 
-应用私有目录：
+- `compat_video.mp4`：更兼容的 MP4 版本
+- `fallback_audio.wav`：播放失败时的音频回退文件
+
+如果设备无法直接播放某些视频格式，训练页会自动退回到兼容音频播放。
+
+## 评分与反馈
+
+当前评分不是声学级口语测评，而是两层轻量反馈：
+
+1. 文本层
+   - 词级编辑距离对齐
+   - 生成 `matchScore`
+   - 输出 `missedWords`、`extraWords`、`wrongWords`
+2. 发音提示层
+   - 基于英文 G2P 字典把目标词和识别词映射到音素
+   - 生成 IPA 展示
+   - 给出单词级“需要改进 / 错误或漏读”等提示
+
+这意味着它更适合做 Shadowing 练习反馈，不等同于标准化口语评分引擎。
+
+## 本地存储
+
+持久化素材目录：
 
 ```text
 files/shadowing_data/
-└── materials/{materialId}/
-    ├── <source media>
-    ├── clips/... (如果素材包提供)
-    └── recordings/
-        └── rec_{sentenceId}_{timestamp}.wav
+|- materials/{materialId}/
+   |- <source media>
+   |- compat_video.mp4
+   |- fallback_audio.wav
+   |- clips/...
 ```
 
-数据库文件：`shadowing.db`。
+数据库文件：
 
----
+- `shadowing.db`
 
-## 9. Moonshine 模型与原生层
+训练录音文件：
 
-- JNI 库：`shadowing-moonshine`（`app/src/main/cpp`）
-- Moonshine C++ core 已放在 `app/src/main/cpp/moonshine-core`
-- 项目自带模型资源：`app/src/main/assets/moonshine/medium-streaming-en`
-- `MoonshineAsr` 启动时会优先尝试从 assets 提取并加载模型到 `files/moonshine/...`
+- 临时保存在应用缓存目录 `cache/training_attempt_recordings/`
+- 当前评分后不会长期保存原始录音文件，只保存识别文本、分数和错误标签
 
-如果你需要重新准备环境，可参考：
-- `docs/MOONSHINE_SETUP.md`
-- `scripts/setup_moonshine.sh`
+## 数据模型
 
----
+### `materials`
 
-## 10. 开发与运行
+- `id`
+- `title`
+- `type`
+- `sourcePath`
+- `fallbackAudioPath`
+- `coverPath`
+- `language`
+- `createdAt`
+- `updatedAt`
 
-### 环境要求
+### `sentences`
 
-- Android Studio（建议新版本）
-- Android SDK（compile/target 35）
-- NDK `27.0.12077973`
-- CMake `3.22.1`
-- JDK 17
+- `id`
+- `materialId`
+- `index`
+- `textOriginal`
+- `textZh`
+- `startTimeMs`
+- `endTimeMs`
+- `clipPath`
+- `createdAt`
 
-### 启动步骤
+### `practice_records`
 
-```bash
-# 1) 打开工程
-# Android Studio 打开本仓库根目录
+- `id`
+- `materialId`
+- `sentenceId`
+- `recordingPath`
+- `recognizedText`
+- `matchScore`
+- `errorTags`
+- `createdAt`
 
-# 2) 同步依赖
-# Sync Project with Gradle Files
+### `sentence_latest_results`
 
-# 3) 构建并运行
-# 运行 app 模块到 arm64-v8a 设备/模拟器
-```
+- `sentenceId`
+- `latestPracticeRecordId`
+- `latestRecognizedText`
+- `latestScore`
+- `updatedAt`
 
-> 注意：`abiFilters` 当前只包含 `arm64-v8a`，请使用 arm64 设备或对应模拟器。
-
----
-
-## 11. 当前限制与后续方向
-
-### 当前限制
-
-- 文本比对仅词级，不含发音韵律评估
-- 暂无设置页（DataStore 依赖已引入，但功能未落地）
-- 导入媒体时默认语言 `en`
-- `READ_MEDIA_VIDEO` 未声明，视频导入能力可能受系统版本/厂商行为影响（当前主要声明了音频读取权限）
-
-### 后续建议
-
-- 增加设置中心（播放速度默认值、循环策略、模型切换）
-- 引入更细粒度评分（发音、停顿、语速）
-- 补齐历史练习记录页与可视化趋势
-- 完善视频权限与导入兼容性
-
----
-
-## 12. 目录结构速览
+## 目录结构
 
 ```text
 app/src/main/java/com/orien/shadowing/
-├── data/
-│   ├── local/          # 播放、录音、ASR、DAO、Repository
-│   └── model/          # Room 实体
-├── domain/usecase/     # 导入、Demo 生成、文本比对
-├── presentation/
-│   ├── materiallist/
-│   ├── sentencelist/
-│   ├── training/
-│   └── navigation/
-├── di/                 # Hilt Module
-└── MainActivity.kt
+|- data/
+|  |- local/
+|  |- model/
+|- domain/usecase/
+|- presentation/
+|  |- materiallist/
+|  |- sentencelist/
+|  |- training/
+|  |- navigation/
+|- di/
+|- MainActivity.kt
 
-app/src/main/cpp/       # Moonshine JNI + C++ core
-app/src/main/assets/    # Moonshine 模型资源
-docs/                   # 补充文档
-scripts/                # 环境脚本
+app/src/main/assets/
+|- dictionary/
+|- moonshine/
+
+app/src/main/cpp/
+|- Moonshine JNI 和 C++ 核心
+
+docs/
+|- 补充文档
+
+scripts/
+|- 环境初始化脚本
 ```
+
+## 当前限制
+
+- 目前主流程围绕英文素材设计，原始媒体导入默认语言也是 `en`
+- 评分核心仍然是文本对齐加启发式音素提示，不是完整的声学评分
+- 当前没有练习历史页面，只保存句子级最近结果
+- `practice_records.recordingPath` 字段当前没有实际持久化录音文件
+- 仓库未提交 Gradle Wrapper 脚本，命令行构建体验不完整
+
+## 相关文件
+
+- `docs/MOONSHINE_SETUP.md`
+- `scripts/setup_moonshine.sh`
+
+如果你现在要继续补功能，最值得优先做的通常是：
+
+- 补练习历史页和结果统计
+- 把设置页落地（默认语速、循环策略、模型选择）
+- 明确是否要长期保存用户录音
+- 如果要提高评分可信度，再引入更细粒度的声学特征评估

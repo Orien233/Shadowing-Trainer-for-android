@@ -10,6 +10,7 @@ import androidx.lifecycle.viewModelScope
 import com.orien.shadowing.data.local.AudioPlayer
 import com.orien.shadowing.data.local.AudioRecorder
 import com.orien.shadowing.data.local.MoonshineAsr
+import com.orien.shadowing.data.local.MoonshineAsrFactory
 import com.orien.shadowing.data.local.dao.SentenceDao
 import com.orien.shadowing.data.local.repository.MaterialRepository
 import com.orien.shadowing.data.local.repository.PracticeRepository
@@ -67,7 +68,7 @@ class TrainingViewModel @Inject constructor(
     private val practiceRepository: PracticeRepository,
     private val audioPlayer: AudioPlayer,
     private val audioRecorder: AudioRecorder,
-    private val moonshineAsr: MoonshineAsr,
+    moonshineAsrFactory: MoonshineAsrFactory,
     private val textCompare: TextCompareUseCase
 ) : ViewModel() {
     private data class PlaybackSource(
@@ -80,6 +81,7 @@ class TrainingViewModel @Inject constructor(
 
     private val materialId: Long = savedStateHandle.get<Long>("materialId") ?: 0L
     private val initialSentenceId: Long = savedStateHandle.get<Long>("sentenceId") ?: 0L
+    private val moonshineAsr: MoonshineAsr = moonshineAsrFactory.create("training:$materialId")
 
     private val _uiState = MutableStateFlow(TrainingUiState())
     val uiState: StateFlow<TrainingUiState> = _uiState.asStateFlow()
@@ -313,9 +315,9 @@ class TrainingViewModel @Inject constructor(
 
     override fun onCleared() {
         super.onCleared()
-        // These services are singletons shared with background imports; do not release them here.
         audioPlayer.stop()
         audioRecorder.cancelRecording()
+        moonshineAsr.release()
     }
 
     private fun loadSentence(sentenceId: Long) {

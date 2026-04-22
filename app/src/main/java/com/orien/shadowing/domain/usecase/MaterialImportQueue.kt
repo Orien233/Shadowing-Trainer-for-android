@@ -5,6 +5,7 @@ import android.content.Intent
 import android.net.Uri
 import android.webkit.MimeTypeMap
 import androidx.documentfile.provider.DocumentFile
+import com.orien.shadowing.data.local.MoonshineAsrFactory
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -48,6 +49,7 @@ data class ImportTaskSnapshot(
 @Singleton
 class MaterialImportQueue @Inject constructor(
     @ApplicationContext private val context: Context,
+    private val moonshineAsrFactory: MoonshineAsrFactory,
     private val importMediaUseCase: ImportMediaUseCase,
     private val importMaterialUseCase: ImportMaterialUseCase,
     private val demoMaterialGenerator: DemoMaterialGenerator
@@ -221,6 +223,7 @@ class MaterialImportQueue @Inject constructor(
             context.cacheDir,
             "media_${System.currentTimeMillis()}_${resolveTempFileName(request.displayName, request.mimeType)}"
         )
+        val moonshineAsr = moonshineAsrFactory.create("import-task:$taskId")
 
         try {
             updateTaskProgress(taskId, 0.05f, "Copying selected media...")
@@ -235,6 +238,7 @@ class MaterialImportQueue @Inject constructor(
             val result = importMediaUseCase.importFromMediaFile(
                 mediaFile = copiedFile,
                 displayName = request.displayName,
+                moonshineAsr = moonshineAsr,
                 mimeType = request.mimeType
             ) { progress ->
                 updateTaskProgress(
@@ -245,6 +249,7 @@ class MaterialImportQueue @Inject constructor(
             }
             handleImportResult(taskId, result)
         } finally {
+            moonshineAsr.release()
             copiedFile.delete()
         }
     }

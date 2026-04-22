@@ -3,6 +3,7 @@ package com.orien.shadowing.domain.usecase
 import android.content.Context
 import android.media.MediaExtractor
 import android.util.Log
+import com.orien.shadowing.data.local.MoonshineAsr
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -23,7 +24,6 @@ import kotlin.system.measureTimeMillis
  */
 class ImportMediaUseCase @Inject constructor(
     @ApplicationContext private val context: Context,
-    private val moonshineAsr: com.orien.shadowing.data.local.MoonshineAsr,
     private val importMaterialUseCase: ImportMaterialUseCase
 ) {
     companion object {
@@ -36,6 +36,7 @@ class ImportMediaUseCase @Inject constructor(
 
     suspend fun importFromMediaFile(
         mediaFile: File,
+        moonshineAsr: MoonshineAsr,
         displayName: String = mediaFile.name,
         mimeType: String? = null,
         onProgress: ImportProgressListener = {}
@@ -79,7 +80,7 @@ class ImportMediaUseCase @Inject constructor(
             )
 
             onProgress.report(0.4f, "Analyzing media...")
-            lateinit var transcript: com.orien.shadowing.data.local.MoonshineAsr.AsrResult
+            lateinit var transcript: MoonshineAsr.AsrResult
             val transcribeElapsedMs = measureTimeMillis {
                 transcript = moonshineAsr.transcribe(packagedMediaFile.absolutePath)
             }
@@ -164,7 +165,7 @@ class ImportMediaUseCase @Inject constructor(
 
     private fun writeSentencesJson(
         packageDir: File,
-        lines: List<com.orien.shadowing.data.local.MoonshineAsr.AsrLine>
+        lines: List<MoonshineAsr.AsrLine>
     ) {
         val sentenceArray = buildJsonArray {
             lines.forEachIndexed { index, line ->
@@ -185,7 +186,7 @@ class ImportMediaUseCase @Inject constructor(
 
     private fun writeDisputedSentencesJson(
         packageDir: File,
-        lines: List<com.orien.shadowing.data.local.MoonshineAsr.AsrLine>
+        lines: List<MoonshineAsr.AsrLine>
     ) {
         val sentenceArray = buildJsonArray {
             lines.forEachIndexed { index, line ->

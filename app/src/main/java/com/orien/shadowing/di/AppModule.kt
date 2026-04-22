@@ -5,7 +5,6 @@ import android.content.pm.ApplicationInfo
 import androidx.room.Room
 import com.orien.shadowing.data.local.AudioPlayer
 import com.orien.shadowing.data.local.AudioRecorder
-import com.orien.shadowing.data.local.MoonshineAsr
 import com.orien.shadowing.data.local.db.AppDatabase
 import com.orien.shadowing.data.local.db.MIGRATION_1_2
 import com.orien.shadowing.data.local.dao.*
@@ -58,11 +57,4 @@ object AppModule {
     @Singleton
     fun provideAudioRecorder(@ApplicationContext context: Context): AudioRecorder =
         AudioRecorder(context)
-
-    // --- ASR ---
-
-    @Provides
-    @Singleton
-    fun provideMoonshineAsr(@ApplicationContext context: Context): MoonshineAsr =
-        MoonshineAsr(context)
 }

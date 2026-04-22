@@ -4,13 +4,10 @@ import android.util.Log
 import android.content.Context
 import com.orien.shadowing.data.local.moonshine.AudioUtils
 import com.orien.shadowing.data.local.moonshine.MoonshineTranscriber
-import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
-import javax.inject.Inject
-import javax.inject.Singleton
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
@@ -19,9 +16,9 @@ import kotlin.system.measureTimeMillis
 /**
  * On-device ASR wrapper backed by Moonshine.
  */
-@Singleton
-class MoonshineAsr @Inject constructor(
-    @ApplicationContext private val context: Context
+class MoonshineAsr(
+    private val context: Context,
+    private val instanceId: String
 ) {
     private data class ModelSpec(
         val directory: File,
@@ -56,6 +53,7 @@ class MoonshineAsr @Inject constructor(
 
     companion object {
         private const val TAG = "MoonshineAsr"
+        private val modelInstallLock = Any()
         private const val MIN_CHUNK_DURATION_MS = 20_000L
         // Large ASR chunks make long imports look hung on slower devices. Keep the upper bound
         // conservative so decode/transcribe progress stays visible and failures isolate faster.
@@ -78,6 +76,8 @@ class MoonshineAsr @Inject constructor(
             "然后", "但是", "因为", "所以", "并且", "而且", "如果", "当", "同时", "此外"
         )
     }
+
+    private fun withInstance(message: String): String = "[$instanceId] $message"
 
     suspend fun initialize(
         modelPath: String? = null,
@@ -115,8 +115,10 @@ class MoonshineAsr @Inject constructor(
                 val file = File(audioPath)
                 Log.i(
                     TAG,
-                    "Starting ASR for ${file.name}: useChunked=${shouldUseChunkedTranscription(file)}, " +
+                    withInstance(
+                        "Starting ASR for ${file.name}: useChunked=${shouldUseChunkedTranscription(file)}, " +
                         "durationMs=${AudioUtils.resolveMediaDurationMs(audioPath) ?: -1L}"
+                    )
                 )
                 val result = if (shouldUseChunkedTranscription(file)) {
                     transcribeInChunks(file, loadedTranscriber)
@@ -135,16 +137,18 @@ class MoonshineAsr @Inject constructor(
                 result.copy(durationMs = System.currentTimeMillis() - startTime).also { finalResult ->
                     Log.i(
                         TAG,
-                        "Finished ASR for ${file.name}: elapsedMs=${finalResult.durationMs}, " +
+                        withInstance(
+                            "Finished ASR for ${file.name}: elapsedMs=${finalResult.durationMs}, " +
                             "lineCount=${finalResult.lines.size}, disputedCount=${finalResult.disputedLines.size}, " +
                             "error=${finalResult.errorMessage}"
+                        )
                     )
                 }
             } catch (error: Throwable) {
                 if (error is CancellationException) {
                     throw error
                 }
-                Log.e(TAG, "Failed to transcribe $audioPath", error)
+                Log.e(TAG, withInstance("Failed to transcribe $audioPath"), error)
                 AsrResult(
                     text = "",
                     durationMs = System.currentTimeMillis() - startTime,
@@ -198,22 +202,26 @@ class MoonshineAsr @Inject constructor(
                 )
                 break
             }
-            Log.i(
-                TAG,
-                "ASR chunk start for ${file.name}: chunk=$chunkIndex, " +
-                    "range=${chunkStartMs}..${chunkEndMs}ms, samples=${chunkSamples.size}, " +
-                    "decodeElapsedMs=$decodeElapsedMs"
-            )
+                Log.i(
+                    TAG,
+                    withInstance(
+                        "ASR chunk start for ${file.name}: chunk=$chunkIndex, " +
+                        "range=${chunkStartMs}..${chunkEndMs}ms, samples=${chunkSamples.size}, " +
+                        "decodeElapsedMs=$decodeElapsedMs"
+                    )
+                )
             lateinit var chunkTranscript: MoonshineTranscriber.Transcript
             val transcribeElapsedMs = measureTimeMillis {
                 chunkTranscript = loadedTranscriber.transcribe(chunkSamples, AudioUtils.TARGET_SAMPLE_RATE)
             }
             Log.i(
                 TAG,
-                "ASR chunk finished for ${file.name}: chunk=$chunkIndex, " +
+                withInstance(
+                    "ASR chunk finished for ${file.name}: chunk=$chunkIndex, " +
                     "range=${chunkStartMs}..${chunkEndMs}ms, samples=${chunkSamples.size}, " +
                     "decodeElapsedMs=$decodeElapsedMs, transcribeElapsedMs=$transcribeElapsedMs, " +
                     "lineCount=${chunkTranscript.lines.size}"
+                )
             )
             val normalizedChunkLines = normalizeLines(chunkTranscript.lines.asList(), offsetMs = chunkStartMs)
             if (chunkStartMs == 0L) {
@@ -471,13 +479,15 @@ class MoonshineAsr @Inject constructor(
         }
 
         return try {
-            val modelSpec = resolveModelSpec(modelPath, arch)
+            val modelSpec = synchronized(modelInstallLock) {
+                resolveModelSpec(modelPath, arch)
+            }
             if (!hasRequiredFiles(modelSpec.directory, modelSpec.arch)) {
                 lastInitErrorMessage =
                     "Missing model files in ${modelSpec.directory.absolutePath} for arch=${modelSpec.arch}"
                 android.util.Log.w(
                     "MoonshineAsr",
-                    lastInitErrorMessage ?: "Missing model files"
+                    withInstance(lastInitErrorMessage ?: "Missing model files")
                 )
                 false
             } else {
@@ -489,7 +499,9 @@ class MoonshineAsr @Inject constructor(
 
                 android.util.Log.i(
                     "MoonshineAsr",
-                    "Loaded Moonshine model from ${modelSpec.directory.absolutePath} with arch=${modelSpec.arch}"
+                    withInstance(
+                        "Loaded Moonshine model from ${modelSpec.directory.absolutePath} with arch=${modelSpec.arch}"
+                    )
                 )
                 true
             }
@@ -497,7 +509,7 @@ class MoonshineAsr @Inject constructor(
             if (error is CancellationException) {
                 throw error
             }
-            android.util.Log.e("MoonshineAsr", "Failed to initialize Moonshine", error)
+            android.util.Log.e("MoonshineAsr", withInstance("Failed to initialize Moonshine"), error)
             transcriber?.release()
             transcriber = null
             isInitialized = false

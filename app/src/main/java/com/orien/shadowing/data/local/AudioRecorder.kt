@@ -29,6 +29,7 @@ class AudioRecorder @Inject constructor(
         private const val CHANNEL_COUNT = 1
         private const val BITS_PER_SAMPLE = 16
         private const val WAV_HEADER_SIZE = 44
+        private const val CACHE_RECORDING_DIR = "training_attempt_recordings"
     }
 
     private var recorder: AudioRecord? = null
@@ -52,11 +53,15 @@ class AudioRecorder @Inject constructor(
     fun startRecording(materialId: Long, sentenceId: Long): String {
         check(!_isRecording.value) { "A recording is already in progress." }
 
-        val recordingsDir = File(context.filesDir, "shadowing_data/materials/$materialId/recordings")
+        val recordingsDir = File(context.cacheDir, CACHE_RECORDING_DIR)
         recordingsDir.mkdirs()
+        recordingsDir.listFiles()?.forEach { existing ->
+            if (existing.isFile) {
+                runCatching { existing.delete() }
+            }
+        }
 
-        val timestamp = System.currentTimeMillis()
-        val outputFile = File(recordingsDir, "rec_${sentenceId}_$timestamp.wav")
+        val outputFile = File(recordingsDir, "attempt_${materialId}_${sentenceId}.wav")
         currentFile = outputFile
 
         val bufferSize = resolveBufferSize()

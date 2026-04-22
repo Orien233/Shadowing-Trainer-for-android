@@ -12,6 +12,7 @@ import com.orien.shadowing.data.local.AudioRecorder
 import com.orien.shadowing.data.local.MoonshineAsr
 import com.orien.shadowing.data.local.MoonshineAsrFactory
 import com.orien.shadowing.data.local.dao.SentenceDao
+import com.orien.shadowing.data.local.moonshine.AudioUtils
 import com.orien.shadowing.data.local.repository.MaterialRepository
 import com.orien.shadowing.data.local.repository.PracticeRepository
 import com.orien.shadowing.data.model.MaterialEntity
@@ -53,6 +54,10 @@ data class TrainingUiState(
     val pronunciationHints: List<WordPronunciationHint> = emptyList(),
     val latestResult: SentenceLatestResultEntity? = null,
     val recordingPath: String? = null,
+    val recordingDurationMs: Long? = null,
+    val segmentDurationMs: Long? = null,
+    val attemptPlaybackState: AttemptPlaybackState = AttemptPlaybackState.IDLE,
+    val activePlaybackTarget: TrainingPlaybackTarget? = null,
     val playbackSpeed: Float = 1.0f,
     val loopEnabled: Boolean = false,
     val errorMessage: String? = null
@@ -60,6 +65,18 @@ data class TrainingUiState(
 
 sealed interface TrainingEvent {
     data class ShowMessage(val message: String) : TrainingEvent
+}
+
+enum class TrainingPlaybackTarget {
+    SENTENCE,
+    ATTEMPT
+}
+
+enum class AttemptPlaybackState {
+    IDLE,
+    PLAYING,
+    STOPPED,
+    COMPLETED
 }
 
 @HiltViewModel
@@ -91,6 +108,8 @@ class TrainingViewModel @Inject constructor(
     private val _events = MutableSharedFlow<TrainingEvent>()
     val events = _events.asSharedFlow()
     private val hasVideoTrackCache = mutableMapOf<String, Boolean>()
+    private var pendingPlaybackTarget: TrainingPlaybackTarget? = null
+    private var manualAttemptPlaybackStop = false
 
     companion object {
         private const val TAG = "TrainingViewModel"
@@ -102,7 +121,41 @@ class TrainingViewModel @Inject constructor(
 
         viewModelScope.launch {
             audioPlayer.isPlaying.collect { playing ->
-                _uiState.update { it.copy(isPlaying = playing) }
+                _uiState.update { current ->
+                    if (playing) {
+                        val playbackTarget = pendingPlaybackTarget ?: current.activePlaybackTarget
+                        pendingPlaybackTarget = null
+                        current.copy(
+                            isPlaying = true,
+                            activePlaybackTarget = playbackTarget,
+                            attemptPlaybackState = if (playbackTarget == TrainingPlaybackTarget.ATTEMPT) {
+                                AttemptPlaybackState.PLAYING
+                            } else {
+                                current.attemptPlaybackState
+                            }
+                        )
+                    } else {
+                        val attemptPlaybackState = when {
+                            current.recordingPath == null -> AttemptPlaybackState.IDLE
+                            current.activePlaybackTarget == TrainingPlaybackTarget.ATTEMPT &&
+                                current.isPlaying -> {
+                                if (manualAttemptPlaybackStop) {
+                                    AttemptPlaybackState.STOPPED
+                                } else {
+                                    AttemptPlaybackState.COMPLETED
+                                }
+                            }
+
+                            else -> current.attemptPlaybackState
+                        }
+                        manualAttemptPlaybackStop = false
+                        current.copy(
+                            isPlaying = false,
+                            activePlaybackTarget = null,
+                            attemptPlaybackState = attemptPlaybackState
+                        )
+                    }
+                }
             }
         }
 
@@ -129,6 +182,7 @@ class TrainingViewModel @Inject constructor(
             return
         }
 
+        beginPlayback(TrainingPlaybackTarget.SENTENCE)
         audioPlayer.playSegment(
             filePath = playbackSource.filePath,
             startTimeMs = playbackSource.startTimeMs,
@@ -151,6 +205,8 @@ class TrainingViewModel @Inject constructor(
     }
 
     fun stopPlayback() {
+        markManualAttemptStopIfNeeded()
+        pendingPlaybackTarget = null
         audioPlayer.stop()
     }
 
@@ -170,6 +226,7 @@ class TrainingViewModel @Inject constructor(
 
         val sentence = _uiState.value.sentence ?: return
         audioPlayer.stop()
+        resetAttemptState(deleteRecording = true)
         runCatching {
             audioRecorder.startRecording(materialId, sentence.id)
         }.onSuccess { recordingPath ->
@@ -209,10 +266,19 @@ class TrainingViewModel @Inject constructor(
             viewModelScope.launch {
                 _events.emit(TrainingEvent.ShowMessage("Recording failed."))
             }
+            resetAttemptState(deleteRecording = true)
             return
         }
 
-        _uiState.update { it.copy(isTranscribing = true) }
+        val recordingDurationMs = AudioUtils.resolveMediaDurationMs(recordingPath)
+        _uiState.update {
+            it.copy(
+                isTranscribing = true,
+                recordingPath = recordingPath,
+                recordingDurationMs = recordingDurationMs,
+                attemptPlaybackState = AttemptPlaybackState.IDLE
+            )
+        }
         viewModelScope.launch {
             val sentence = _uiState.value.sentence
             if (sentence == null) {
@@ -241,7 +307,6 @@ class TrainingViewModel @Inject constructor(
                 val recordId = practiceRepository.savePracticeResult(
                     materialId = materialId,
                     sentenceId = sentence.id,
-                    recordingPath = recordingPath,
                     recognizedText = asrResult.text,
                     matchScore = compareResult.matchScore,
                     errorTags = errorTagsJson
@@ -263,6 +328,8 @@ class TrainingViewModel @Inject constructor(
                         pronunciationHints = feedbackResult.pronunciationHints,
                         latestResult = latestResult,
                         recordingPath = recordingPath,
+                        recordingDurationMs = recordingDurationMs,
+                        attemptPlaybackState = AttemptPlaybackState.IDLE,
                         errorMessage = null
                     )
                 }
@@ -274,6 +341,9 @@ class TrainingViewModel @Inject constructor(
                 _uiState.update {
                     it.copy(
                         isTranscribing = false,
+                        recordingPath = recordingPath,
+                        recordingDurationMs = recordingDurationMs,
+                        attemptPlaybackState = AttemptPlaybackState.IDLE,
                         errorMessage = error.message ?: "Scoring failed on this device."
                     )
                 }
@@ -288,6 +358,38 @@ class TrainingViewModel @Inject constructor(
 
     fun cancelRecording() {
         audioRecorder.cancelRecording()
+        resetAttemptState(deleteRecording = true)
+    }
+
+    fun toggleAttemptPlayback() {
+        val state = _uiState.value
+        if (state.isRecording || state.isTranscribing) {
+            return
+        }
+
+        val recordingPath = state.recordingPath
+            ?.takeIf { path -> path.isNotBlank() && File(path).exists() }
+
+        if (recordingPath == null) {
+            resetAttemptState(deleteRecording = true)
+            viewModelScope.launch {
+                _events.emit(TrainingEvent.ShowMessage("Current recording is no longer available."))
+            }
+            return
+        }
+
+        if (
+            state.activePlaybackTarget == TrainingPlaybackTarget.ATTEMPT &&
+            state.isPlaying
+        ) {
+            manualAttemptPlaybackStop = true
+            pendingPlaybackTarget = null
+            audioPlayer.stop()
+            return
+        }
+
+        beginPlayback(TrainingPlaybackTarget.ATTEMPT)
+        audioPlayer.playClip(recordingPath)
     }
 
     fun nextSentence() {
@@ -323,8 +425,11 @@ class TrainingViewModel @Inject constructor(
 
     override fun onCleared() {
         super.onCleared()
+        pendingPlaybackTarget = null
+        manualAttemptPlaybackStop = false
         audioPlayer.stop()
         audioRecorder.cancelRecording()
+        deleteRecordingFile(_uiState.value.recordingPath)
         moonshineAsr.release()
     }
 
@@ -363,6 +468,10 @@ class TrainingViewModel @Inject constructor(
                     pronunciationHints = emptyList(),
                     latestResult = latestResult,
                     recordingPath = null,
+                    recordingDurationMs = null,
+                    segmentDurationMs = resolveSegmentDurationMs(sentence),
+                    attemptPlaybackState = AttemptPlaybackState.IDLE,
+                    activePlaybackTarget = null,
                     errorMessage = null
                 )
             }
@@ -599,7 +708,70 @@ class TrainingViewModel @Inject constructor(
     }
 
     private fun resetForNavigation() {
+        pendingPlaybackTarget = null
+        manualAttemptPlaybackStop = false
         audioPlayer.stop()
         audioRecorder.cancelRecording()
+        deleteRecordingFile(_uiState.value.recordingPath)
+    }
+
+    private fun beginPlayback(target: TrainingPlaybackTarget) {
+        if (
+            target != TrainingPlaybackTarget.ATTEMPT &&
+            _uiState.value.activePlaybackTarget == TrainingPlaybackTarget.ATTEMPT &&
+            _uiState.value.isPlaying
+        ) {
+            manualAttemptPlaybackStop = true
+        }
+        pendingPlaybackTarget = target
+    }
+
+    private fun markManualAttemptStopIfNeeded() {
+        if (_uiState.value.activePlaybackTarget == TrainingPlaybackTarget.ATTEMPT) {
+            manualAttemptPlaybackStop = true
+        }
+    }
+
+    private fun resetAttemptState(deleteRecording: Boolean) {
+        val recordingPath = _uiState.value.recordingPath
+        pendingPlaybackTarget = null
+        manualAttemptPlaybackStop = false
+        if (deleteRecording) {
+            deleteRecordingFile(recordingPath)
+        }
+        _uiState.update {
+            it.copy(
+                recognizedText = null,
+                compareResult = null,
+                wordFeedback = emptyList(),
+                pronunciationHints = emptyList(),
+                recordingPath = null,
+                recordingDurationMs = null,
+                attemptPlaybackState = AttemptPlaybackState.IDLE,
+                activePlaybackTarget = null,
+                errorMessage = null
+            )
+        }
+    }
+
+    private fun resolveSegmentDurationMs(sentence: SentenceEntity): Long? {
+        val startTimeMs = sentence.startTimeMs
+        val endTimeMs = sentence.endTimeMs
+        return if (startTimeMs != null && endTimeMs != null && endTimeMs > startTimeMs) {
+            endTimeMs - startTimeMs
+        } else {
+            null
+        }
+    }
+
+    private fun deleteRecordingFile(path: String?) {
+        if (path.isNullOrBlank()) {
+            return
+        }
+        runCatching {
+            File(path).takeIf(File::exists)?.delete()
+        }.onFailure { error ->
+            Log.w(TAG, "Failed to delete cached recording: $path", error)
+        }
     }
 }

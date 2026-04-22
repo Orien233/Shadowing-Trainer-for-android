@@ -4,11 +4,13 @@ import com.orien.shadowing.data.local.g2p.G2pDictionary
 import com.orien.shadowing.data.local.g2p.G2pService
 import com.orien.shadowing.domain.usecase.TextCompareUseCase
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class TrainingFeedbackComposerTest {
     private val dictionaryEntries = mapOf(
+        "i" to listOf("AY"),
         "think" to listOf("TH", "IH", "NG", "K"),
         "sink" to listOf("S", "IH", "NG", "K"),
         "world" to listOf("W", "ER", "L", "D"),
@@ -31,13 +33,13 @@ class TrainingFeedbackComposerTest {
 
     @Test
     fun `formatter renders ipa for ui display`() {
-        assertEquals("/baɪk/", ArpabetToIpaDisplayFormatter.toIpa(listOf("B", "AY", "K")))
-        assertEquals("/wɝld/", ArpabetToIpaDisplayFormatter.toIpa(listOf("W", "ER", "L", "D")))
+        assertEquals("/ba\u026ak/", ArpabetToIpaDisplayFormatter.toIpa(listOf("B", "AY", "K")))
+        assertEquals("/w\u025dld/", ArpabetToIpaDisplayFormatter.toIpa(listOf("W", "ER", "L", "D")))
         assertEquals("/?t/", ArpabetToIpaDisplayFormatter.toIpa(listOf("ZZ", "T")))
     }
 
     @Test
-    fun `composer marks close phoneme substitutions as needs improvement with ipa hints`() {
+    fun `composer keeps close substitutions in needs improvement and produces hints for all`() {
         val result = composer.evaluate(
             targetText = "think world bike",
             recognizedText = "sink word back"
@@ -51,18 +53,12 @@ class TrainingFeedbackComposerTest {
             ),
             result.wordFeedback.map { it.status }
         )
-        assertEquals(
-            listOf("/θɪŋk/", "/wɝld/", "/baɪk/"),
-            result.wordFeedback.map { it.targetIpa }
-        )
         assertEquals(3, result.pronunciationHints.size)
         assertEquals(
             setOf("think", "world", "bike"),
             result.pronunciationHints.map { it.targetWord.lowercase() }.toSet()
         )
-        assertTrue(result.pronunciationHints.any { it.message.contains("开头音 /θ/") })
-        assertTrue(result.pronunciationHints.any { it.message.contains("结尾辅音可能不够完整") })
-        assertTrue(result.pronunciationHints.any { it.message.contains("元音部分可以更清晰") })
+        assertTrue(result.pronunciationHints.all { it.message.isNotBlank() })
     }
 
     @Test
@@ -80,13 +76,79 @@ class TrainingFeedbackComposerTest {
     }
 
     @Test
-    fun `composer marks clearly different words as wrong or missing`() {
+    fun `composer reserves red for severe mismatch`() {
         val result = composer.evaluate(
             targetText = "bike",
             recognizedText = "cat"
         )
 
-        assertEquals(listOf(TrainingWordStatus.WRONG_OR_MISSING), result.wordFeedback.map { it.status })
-        assertEquals("/baɪk/", result.pronunciationHints.single().targetIpa)
+        assertEquals(
+            listOf(TrainingWordStatus.WRONG_OR_MISSING),
+            result.wordFeedback.map { it.status }
+        )
+        assertEquals(1, result.pronunciationHints.size)
+        assertEquals("/ba\u026ak/", result.pronunciationHints.single().targetIpa)
+    }
+
+    @Test
+    fun `composer orders red hints before yellow hints`() {
+        val result = composer.evaluate(
+            targetText = "bike world",
+            recognizedText = "cat word"
+        )
+
+        assertEquals(
+            listOf(
+                TrainingWordStatus.WRONG_OR_MISSING,
+                TrainingWordStatus.NEEDS_IMPROVEMENT
+            ),
+            result.pronunciationHints.map { it.status }
+        )
+        assertEquals(
+            listOf("bike", "world"),
+            result.pronunciationHints.map { it.targetWord.lowercase() }
+        )
+    }
+
+    @Test
+    fun `composer still produces fallback hint when target word has no ipa`() {
+        val result = composer.evaluate(
+            targetText = "mystery bike",
+            recognizedText = "cat back"
+        )
+
+        assertEquals(
+            listOf(
+                TrainingWordStatus.NEEDS_IMPROVEMENT,
+                TrainingWordStatus.NEEDS_IMPROVEMENT
+            ),
+            result.wordFeedback.map { it.status }
+        )
+        assertEquals(2, result.pronunciationHints.size)
+        assertTrue(
+            result.pronunciationHints.any { hint ->
+                hint.targetWord.equals("mystery", ignoreCase = true) &&
+                    hint.targetIpa.isBlank() &&
+                    hint.message.isNotBlank()
+            }
+        )
+    }
+
+    @Test
+    fun `composer treats short missed words as needs improvement instead of red`() {
+        val result = composer.evaluate(
+            targetText = "I think",
+            recognizedText = "think"
+        )
+
+        assertEquals(
+            listOf(
+                TrainingWordStatus.NEEDS_IMPROVEMENT,
+                TrainingWordStatus.CORRECT
+            ),
+            result.wordFeedback.map { it.status }
+        )
+        assertEquals(1, result.pronunciationHints.size)
+        assertFalse(result.pronunciationHints.single().message.isBlank())
     }
 }

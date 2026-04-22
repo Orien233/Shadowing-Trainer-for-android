@@ -35,7 +35,6 @@ class PracticeRepository @Inject constructor(
     suspend fun savePracticeResult(
         materialId: Long,
         sentenceId: Long,
-        recordingPath: String,
         recognizedText: String,
         matchScore: Float,
         errorTags: String?
@@ -43,7 +42,7 @@ class PracticeRepository @Inject constructor(
         val record = PracticeRecordEntity(
             materialId = materialId,
             sentenceId = sentenceId,
-            recordingPath = recordingPath,
+            recordingPath = "",
             recognizedText = recognizedText,
             matchScore = matchScore,
             errorTags = errorTags

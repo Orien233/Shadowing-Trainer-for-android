@@ -42,6 +42,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -60,6 +61,7 @@ import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
 import com.orien.shadowing.presentation.components.rememberAudioPermission
 import kotlinx.coroutines.flow.collect
+import java.util.Locale
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -139,7 +141,8 @@ fun TrainingScreen(
                 }
 
                 PlaybackControls(
-                    isPlaying = state.isPlaying,
+                    isPlaying = state.activePlaybackTarget == TrainingPlaybackTarget.SENTENCE &&
+                        state.isPlaying,
                     playbackSpeed = state.playbackSpeed,
                     loopEnabled = state.loopEnabled,
                     onPlay = viewModel::playSentence,
@@ -184,9 +187,14 @@ fun TrainingScreen(
                     RecordingControls(
                         isRecording = state.isRecording,
                         isTranscribing = state.isTranscribing,
+                        hasReplayableRecording = state.recordingPath != null,
+                        recordingDurationMs = state.recordingDurationMs,
+                        segmentDurationMs = state.segmentDurationMs,
+                        attemptPlaybackState = state.attemptPlaybackState,
                         onStartRecording = viewModel::startRecording,
                         onStopRecording = viewModel::stopRecordingAndEvaluate,
-                        onCancelRecording = viewModel::cancelRecording
+                        onCancelRecording = viewModel::cancelRecording,
+                        onToggleAttemptPlayback = viewModel::toggleAttemptPlayback
                     )
                 }
 
@@ -357,10 +365,20 @@ private fun PlaybackControls(
 private fun RecordingControls(
     isRecording: Boolean,
     isTranscribing: Boolean,
+    hasReplayableRecording: Boolean,
+    recordingDurationMs: Long?,
+    segmentDurationMs: Long?,
+    attemptPlaybackState: AttemptPlaybackState,
     onStartRecording: () -> Unit,
     onStopRecording: () -> Unit,
-    onCancelRecording: () -> Unit
+    onCancelRecording: () -> Unit,
+    onToggleAttemptPlayback: () -> Unit
 ) {
+    val durationSummary = buildDurationSummary(
+        recordingDurationMs = recordingDurationMs,
+        segmentDurationMs = segmentDurationMs
+    )
+
     Card(modifier = Modifier.fillMaxWidth()) {
         Column(
             modifier = Modifier.padding(16.dp),
@@ -403,6 +421,36 @@ private fun RecordingControls(
                         Spacer(modifier = Modifier.width(4.dp))
                         Text("Start recording")
                     }
+                    if (hasReplayableRecording || durationSummary != null) {
+                        Spacer(modifier = Modifier.height(8.dp))
+                    }
+                    if (hasReplayableRecording) {
+                        TextButton(onClick = onToggleAttemptPlayback) {
+                            Icon(
+                                imageVector = if (attemptPlaybackState == AttemptPlaybackState.PLAYING) {
+                                    Icons.Default.Stop
+                                } else {
+                                    Icons.Default.PlayArrow
+                                },
+                                contentDescription = null
+                            )
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text(
+                                if (attemptPlaybackState == AttemptPlaybackState.PLAYING) {
+                                    "\u505c\u6b62\u56de\u653e"
+                                } else {
+                                    "\u56de\u653e\u672c\u6b21\u5f55\u97f3"
+                                }
+                            )
+                        }
+                    }
+                    durationSummary?.let { summary ->
+                        Text(
+                            text = summary,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
                 }
             }
         }
@@ -415,14 +463,17 @@ private fun ResultPanel(
     pronunciationHints: List<WordPronunciationHint>
 ) {
     compareResult ?: return
+    val criticalHints = pronunciationHints.filter { it.status == TrainingWordStatus.WRONG_OR_MISSING }
+    val improvementHints =
+        pronunciationHints.filter { it.status == TrainingWordStatus.NEEDS_IMPROVEMENT }
 
     Card(modifier = Modifier.fillMaxWidth()) {
         Column(modifier = Modifier.padding(16.dp)) {
-            Text("Pronunciation feedback", style = MaterialTheme.typography.labelMedium)
+            Text("发音反馈", style = MaterialTheme.typography.labelMedium)
             Spacer(modifier = Modifier.height(8.dp))
             val scorePercent = (compareResult.matchScore * 100).toInt()
             Text(
-                text = "Match score: $scorePercent%",
+                text = "匹配分：$scorePercent%",
                 style = MaterialTheme.typography.titleMedium,
                 color = when {
                     compareResult.matchScore >= 0.8f -> MaterialTheme.colorScheme.primary
@@ -435,35 +486,72 @@ private fun ResultPanel(
                 Spacer(modifier = Modifier.height(8.dp))
                 Text(
                     text = if (compareResult.matchScore >= 0.95f) {
-                        "No word-level pronunciation hints for this attempt."
+                        "这次读得比较稳，没有需要单独提示的词。"
                     } else {
-                        "No clear word-level hint yet. Try another recording."
+                        "这次还没有足够明确的词级提示，建议再录一次试试。"
                     },
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
             } else {
                 Spacer(modifier = Modifier.height(12.dp))
-                pronunciationHints.forEachIndexed { index, hint ->
-                    if (index > 0) {
-                        Spacer(modifier = Modifier.height(12.dp))
+                if (criticalHints.isNotEmpty()) {
+                    Text(
+                        text = "优先纠正",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.error
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    criticalHints.forEachIndexed { index, hint ->
+                        if (index > 0) {
+                            Spacer(modifier = Modifier.height(12.dp))
+                        }
+                        PronunciationHintItem(hint = hint)
                     }
+                }
+
+                if (criticalHints.isNotEmpty() && improvementHints.isNotEmpty()) {
+                    Spacer(modifier = Modifier.height(16.dp))
+                }
+
+                if (improvementHints.isNotEmpty()) {
                     Text(
-                        text = "${hint.targetWord} ${hint.targetIpa}",
-                        style = MaterialTheme.typography.titleSmall,
-                        fontWeight = FontWeight.SemiBold,
-                        color = colorForWordStatus(hint.status)
+                        text = "继续打磨",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = Color(0xFFE68619)
                     )
-                    Spacer(modifier = Modifier.height(2.dp))
-                    Text(
-                        text = hint.message,
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    improvementHints.forEachIndexed { index, hint ->
+                        if (index > 0) {
+                            Spacer(modifier = Modifier.height(12.dp))
+                        }
+                        PronunciationHintItem(hint = hint)
+                    }
                 }
             }
         }
     }
+}
+
+@Composable
+private fun PronunciationHintItem(hint: WordPronunciationHint) {
+    val titleText = listOfNotNull(
+        hint.targetWord,
+        hint.targetIpa.takeIf { it.isNotBlank() }
+    ).joinToString(" ")
+
+    Text(
+        text = titleText,
+        style = MaterialTheme.typography.titleSmall,
+        fontWeight = FontWeight.SemiBold,
+        color = colorForWordStatus(hint.status)
+    )
+    Spacer(modifier = Modifier.height(2.dp))
+    Text(
+        text = hint.message,
+        style = MaterialTheme.typography.bodyMedium,
+        color = MaterialTheme.colorScheme.onSurfaceVariant
+    )
 }
 
 @Composable
@@ -501,6 +589,21 @@ private fun colorForWordStatus(status: TrainingWordStatus): Color = when (status
     TrainingWordStatus.NEEDS_IMPROVEMENT -> Color(0xFFE68619)
     TrainingWordStatus.WRONG_OR_MISSING -> MaterialTheme.colorScheme.error
     TrainingWordStatus.UNKNOWN -> MaterialTheme.colorScheme.onSurfaceVariant
+}
+
+private fun buildDurationSummary(
+    recordingDurationMs: Long?,
+    segmentDurationMs: Long?
+): String? {
+    val parts = listOfNotNull(
+        recordingDurationMs?.let { "\u5f55\u97f3 ${formatDurationMs(it)}" },
+        segmentDurationMs?.let { "\u9009\u6bb5 ${formatDurationMs(it)}" }
+    )
+    return parts.takeIf { it.isNotEmpty() }?.joinToString(" \u00b7 ")
+}
+
+private fun formatDurationMs(durationMs: Long): String {
+    return String.format(Locale.US, "%.1fs", durationMs.coerceAtLeast(0L) / 1000f)
 }
 
 @Composable

@@ -46,8 +46,7 @@ class TrainingFeedbackComposer @Inject constructor(
 
     private data class HintCandidate(
         val hint: WordPronunciationHint,
-        val wordIndex: Int,
-        val phonemeSimilarity: Float?
+        val wordIndex: Int
     )
 
     fun evaluate(targetText: String, recognizedText: String): TrainingFeedbackResult {
@@ -74,9 +73,11 @@ class TrainingFeedbackComposer @Inject constructor(
                 ?.let { recognizedPhonemes.getOrNull(it) }
             val status = resolveStatus(
                 alignment = alignment,
+                targetWord = normalizedWord,
                 targetPhonemes = targetResult?.phonemes,
                 recognizedPhonemes = recognizedResult?.phonemes,
-                lowEvidence = lowEvidence
+                lowEvidence = lowEvidence,
+                matchScore = compareResult.matchScore
             )
             val feedback = TargetWordFeedback(
                 index = index,
@@ -97,17 +98,13 @@ class TrainingFeedbackComposer @Inject constructor(
         }
 
         val pronunciationHints = evidenceList
-            .mapNotNull { evidence ->
-                buildHintCandidate(evidence)
-            }
+            .mapNotNull(::buildHintCandidate)
             .sortedWith(
                 compareBy<HintCandidate>(
-                    { statusPriority(it.hint.status) },
-                    { it.phonemeSimilarity ?: -1f },
+                    { hintPriority(it.hint.status) },
                     { it.wordIndex }
                 )
             )
-            .take(MAX_HINTS)
             .map { it.hint }
 
         return TrainingFeedbackResult(
@@ -119,26 +116,26 @@ class TrainingFeedbackComposer @Inject constructor(
 
     private fun buildHintCandidate(evidence: WordEvidence): HintCandidate? {
         val status = evidence.feedback.status
-        val targetIpa = evidence.feedback.targetIpa
-        val targetPhonemes = evidence.targetPhonemes
         if (status == TrainingWordStatus.CORRECT || status == TrainingWordStatus.UNKNOWN) {
             return null
         }
-        if (targetIpa == null || targetPhonemes.isNullOrEmpty()) {
-            return null
-        }
 
+        val targetIpa = evidence.feedback.targetIpa.orEmpty()
         val message = when {
-            evidence.recognizedPhonemes.isNullOrEmpty() -> when (status) {
-                TrainingWordStatus.WRONG_OR_MISSING ->
-                    "这个词可能漏读或不够清晰，目标发音 $targetIpa"
+            evidence.targetPhonemes.isNullOrEmpty() || targetIpa.isBlank() ->
+                buildFallbackMessage(
+                    targetWord = evidence.feedback.targetWord,
+                    status = status
+                )
 
-                else ->
-                    "再把这个词读得更清楚一些，目标发音 $targetIpa"
-            }
+            evidence.recognizedPhonemes.isNullOrEmpty() ->
+                buildMissingWordMessage(
+                    targetIpa = targetIpa,
+                    status = status
+                )
 
             else -> buildMessage(
-                targetPhonemes = targetPhonemes,
+                targetPhonemes = evidence.targetPhonemes,
                 recognizedPhonemes = evidence.recognizedPhonemes,
                 targetIpa = targetIpa
             )
@@ -151,9 +148,19 @@ class TrainingFeedbackComposer @Inject constructor(
                 message = message,
                 status = status
             ),
-            wordIndex = evidence.feedback.index,
-            phonemeSimilarity = evidence.phonemeSimilarity
+            wordIndex = evidence.feedback.index
         )
+    }
+
+    private fun buildMissingWordMessage(
+        targetIpa: String,
+        status: TrainingWordStatus
+    ): String = when (status) {
+        TrainingWordStatus.WRONG_OR_MISSING ->
+            "这个词可能漏读了，或和目标读音差距较大。目标发音 $targetIpa"
+
+        else ->
+            "这个词再读清楚一点。目标发音 $targetIpa"
     }
 
     private fun buildMessage(
@@ -162,7 +169,7 @@ class TrainingFeedbackComposer @Inject constructor(
         targetIpa: String
     ): String {
         val mismatchIndex = firstMismatchTargetIndex(targetPhonemes, recognizedPhonemes)
-            ?: return "整体发音可以更稳定，目标发音 $targetIpa"
+            ?: return "整体发音还可以更稳定一些。目标发音 $targetIpa"
 
         return when {
             mismatchIndex == 0 -> {
@@ -183,11 +190,26 @@ class TrainingFeedbackComposer @Inject constructor(
         }
     }
 
+    private fun buildFallbackMessage(
+        targetWord: String,
+        status: TrainingWordStatus
+    ): String = when (status) {
+        TrainingWordStatus.WRONG_OR_MISSING ->
+            "$targetWord 这个词和目标读法差距较大，建议放慢一点再读一遍"
+
+        TrainingWordStatus.NEEDS_IMPROVEMENT ->
+            "$targetWord 这个词还可以更清晰一些，建议对照原句再读一遍"
+
+        else -> "$targetWord 这个词再读清楚一点"
+    }
+
     private fun resolveStatus(
         alignment: TextCompareUseCase.WordAlignment?,
+        targetWord: String,
         targetPhonemes: List<String>?,
         recognizedPhonemes: List<String>?,
-        lowEvidence: Boolean
+        lowEvidence: Boolean,
+        matchScore: Float
     ): TrainingWordStatus {
         if (alignment == null) {
             return TrainingWordStatus.UNKNOWN
@@ -197,12 +219,22 @@ class TrainingFeedbackComposer @Inject constructor(
             TextCompareUseCase.AlignmentType.Match -> TrainingWordStatus.CORRECT
 
             TextCompareUseCase.AlignmentType.Replace -> {
+                if (lowEvidence) {
+                    return TrainingWordStatus.UNKNOWN
+                }
+
                 val similarity = phonemeSimilarity(targetPhonemes, recognizedPhonemes)
                 when {
-                    similarity != null && similarity >= PHONEME_CLOSE_THRESHOLD ->
+                    similarity == null -> TrainingWordStatus.NEEDS_IMPROVEMENT
+                    similarity >= PHONEME_NEEDS_IMPROVEMENT_THRESHOLD ->
                         TrainingWordStatus.NEEDS_IMPROVEMENT
 
-                    lowEvidence -> TrainingWordStatus.UNKNOWN
+                    isLenientTargetWord(targetWord, targetPhonemes) ->
+                        TrainingWordStatus.NEEDS_IMPROVEMENT
+
+                    similarity >= PHONEME_SEVERE_MISMATCH_THRESHOLD ->
+                        TrainingWordStatus.NEEDS_IMPROVEMENT
+
                     else -> TrainingWordStatus.WRONG_OR_MISSING
                 }
             }
@@ -210,6 +242,11 @@ class TrainingFeedbackComposer @Inject constructor(
             TextCompareUseCase.AlignmentType.Delete -> {
                 if (lowEvidence) {
                     TrainingWordStatus.UNKNOWN
+                } else if (
+                    matchScore >= DELETE_LENIENT_SCORE ||
+                    isLenientTargetWord(targetWord, targetPhonemes)
+                ) {
+                    TrainingWordStatus.NEEDS_IMPROVEMENT
                 } else {
                     TrainingWordStatus.WRONG_OR_MISSING
                 }
@@ -257,7 +294,9 @@ class TrainingFeedbackComposer @Inject constructor(
 
         for (row in 1 until rows) {
             for (col in 1 until cols) {
-                dp[row][col] = if (normalizePhoneme(target[row - 1]) == normalizePhoneme(recognized[col - 1])) {
+                dp[row][col] = if (
+                    normalizePhoneme(target[row - 1]) == normalizePhoneme(recognized[col - 1])
+                ) {
                     dp[row - 1][col - 1]
                 } else {
                     minOf(
@@ -292,7 +331,10 @@ class TrainingFeedbackComposer @Inject constructor(
         }
     }
 
-    private fun isTrailingConsonantIssue(targetPhonemes: List<String>, mismatchIndex: Int): Boolean {
+    private fun isTrailingConsonantIssue(
+        targetPhonemes: List<String>,
+        mismatchIndex: Int
+    ): Boolean {
         if (mismatchIndex >= targetPhonemes.size) {
             return false
         }
@@ -329,7 +371,16 @@ class TrainingFeedbackComposer @Inject constructor(
         return aligned
     }
 
-    private fun statusPriority(status: TrainingWordStatus): Int = when (status) {
+    private fun isLenientTargetWord(
+        targetWord: String,
+        targetPhonemes: List<String>?
+    ): Boolean {
+        return targetWord.length <= SHORT_WORD_LENGTH ||
+            targetPhonemes.isNullOrEmpty() ||
+            targetPhonemes.size <= SHORT_PHONEME_LENGTH
+    }
+
+    private fun hintPriority(status: TrainingWordStatus): Int = when (status) {
         TrainingWordStatus.WRONG_OR_MISSING -> 0
         TrainingWordStatus.NEEDS_IMPROVEMENT -> 1
         TrainingWordStatus.UNKNOWN -> 2
@@ -337,8 +388,11 @@ class TrainingFeedbackComposer @Inject constructor(
     }
 
     private companion object {
-        private const val MAX_HINTS = 3
-        private const val PHONEME_CLOSE_THRESHOLD = 0.66f
+        private const val PHONEME_NEEDS_IMPROVEMENT_THRESHOLD = 0.5f
+        private const val PHONEME_SEVERE_MISMATCH_THRESHOLD = 0.25f
+        private const val DELETE_LENIENT_SCORE = 0.7f
+        private const val SHORT_WORD_LENGTH = 3
+        private const val SHORT_PHONEME_LENGTH = 2
         private val vowelPhonemes = setOf(
             "AA",
             "AE",

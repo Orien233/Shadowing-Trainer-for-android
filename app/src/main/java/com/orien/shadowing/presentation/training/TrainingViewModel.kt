@@ -313,9 +313,9 @@ class TrainingViewModel @Inject constructor(
 
     override fun onCleared() {
         super.onCleared()
-        audioPlayer.release()
+        // These services are singletons shared with background imports; do not release them here.
+        audioPlayer.stop()
         audioRecorder.cancelRecording()
-        moonshineAsr.release()
     }
 
     private fun loadSentence(sentenceId: Long) {

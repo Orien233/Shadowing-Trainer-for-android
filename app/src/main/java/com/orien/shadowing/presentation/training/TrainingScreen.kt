@@ -4,9 +4,11 @@ import android.view.SurfaceHolder
 import android.view.SurfaceView
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.background
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -49,6 +51,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
@@ -124,6 +127,7 @@ fun TrainingScreen(
 
                 if (state.hasVideoPlayback) {
                     VideoPlaybackPanel(
+                        videoAspectRatio = state.videoAspectRatio,
                         onBindVideoSurface = viewModel::bindVideoSurface,
                         onUnbindVideoSurface = viewModel::unbindVideoSurface
                     )
@@ -227,6 +231,7 @@ fun TrainingScreen(
 
 @Composable
 private fun VideoPlaybackPanel(
+    videoAspectRatio: Float?,
     onBindVideoSurface: (SurfaceHolder) -> Unit,
     onUnbindVideoSurface: (SurfaceHolder) -> Unit
 ) {
@@ -234,36 +239,52 @@ private fun VideoPlaybackPanel(
         Column(modifier = Modifier.padding(12.dp)) {
             Text("Video", style = MaterialTheme.typography.labelMedium)
             Spacer(modifier = Modifier.height(8.dp))
-            AndroidView(
+            BoxWithConstraints(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(220.dp),
-                factory = { context ->
-                    SurfaceView(context).apply {
-                        holder.addCallback(object : SurfaceHolder.Callback {
-                            override fun surfaceCreated(holder: SurfaceHolder) {
-                                onBindVideoSurface(holder)
-                            }
-
-                            override fun surfaceChanged(
-                                holder: SurfaceHolder,
-                                format: Int,
-                                width: Int,
-                                height: Int
-                            ) {
-                                onBindVideoSurface(holder)
-                            }
-
-                            override fun surfaceDestroyed(holder: SurfaceHolder) {
-                                onUnbindVideoSurface(holder)
-                            }
-                        })
-                    }
-                },
-                update = { view ->
-                    onBindVideoSurface(view.holder)
+                    .height(220.dp)
+                    .background(Color.Black),
+                contentAlignment = Alignment.Center
+            ) {
+                val resolvedAspectRatio = videoAspectRatio?.takeIf { it > 0f } ?: (16f / 9f)
+                val containerAspectRatio = maxWidth / maxHeight
+                val (contentWidth, contentHeight) = if (resolvedAspectRatio > containerAspectRatio) {
+                    maxWidth to (maxWidth / resolvedAspectRatio)
+                } else {
+                    (maxHeight * resolvedAspectRatio) to maxHeight
                 }
-            )
+
+                AndroidView(
+                    modifier = Modifier
+                        .width(contentWidth)
+                        .height(contentHeight),
+                    factory = { context ->
+                        SurfaceView(context).apply {
+                            holder.addCallback(object : SurfaceHolder.Callback {
+                                override fun surfaceCreated(holder: SurfaceHolder) {
+                                    onBindVideoSurface(holder)
+                                }
+
+                                override fun surfaceChanged(
+                                    holder: SurfaceHolder,
+                                    format: Int,
+                                    width: Int,
+                                    height: Int
+                                ) {
+                                    onBindVideoSurface(holder)
+                                }
+
+                                override fun surfaceDestroyed(holder: SurfaceHolder) {
+                                    onUnbindVideoSurface(holder)
+                                }
+                            })
+                        }
+                    },
+                    update = { view ->
+                        onBindVideoSurface(view.holder)
+                    }
+                )
+            }
         }
     }
 }

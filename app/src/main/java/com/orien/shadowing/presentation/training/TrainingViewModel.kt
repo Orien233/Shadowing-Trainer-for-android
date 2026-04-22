@@ -42,6 +42,7 @@ data class TrainingUiState(
     val playbackStartTimeMs: Long? = null,
     val playbackEndTimeMs: Long? = null,
     val hasVideoPlayback: Boolean = false,
+    val videoAspectRatio: Float? = null,
     val isPlaying: Boolean = false,
     val isRecording: Boolean = false,
     val isTranscribing: Boolean = false,
@@ -330,6 +331,10 @@ class TrainingViewModel @Inject constructor(
             val sentenceIndex = allSentences.indexOfFirst { it.id == sentenceId }.coerceAtLeast(0)
             val latestResult = practiceRepository.getLatestResult(sentenceId)
             val playbackSource = resolvePlaybackSource(sentence, material)
+            val videoAspectRatio = playbackSource
+                ?.takeIf { it.isVideo }
+                ?.filePath
+                ?.let(::resolveVideoAspectRatio)
 
             _uiState.update {
                 it.copy(
@@ -341,6 +346,7 @@ class TrainingViewModel @Inject constructor(
                     playbackStartTimeMs = playbackSource?.startTimeMs,
                     playbackEndTimeMs = playbackSource?.endTimeMs,
                     hasVideoPlayback = playbackSource?.isVideo == true,
+                    videoAspectRatio = videoAspectRatio,
                     recognizedText = null,
                     compareResult = null,
                     latestResult = latestResult,
@@ -517,6 +523,49 @@ class TrainingViewModel @Inject constructor(
                     if (width > 0 && height > 0) true else null
                 }
             }
+        } catch (_: Throwable) {
+            null
+        } finally {
+            runCatching { retriever.release() }
+        }
+    }
+
+    private fun resolveVideoAspectRatio(path: String): Float? {
+        if (path.startsWith("content://")) {
+            return null
+        }
+
+        val localPath = if (path.startsWith("file://")) {
+            android.net.Uri.parse(path).path
+        } else {
+            path
+        } ?: return null
+
+        val retriever = MediaMetadataRetriever()
+        return try {
+            retriever.setDataSource(localPath)
+            val rawWidth =
+                retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)
+                    ?.toFloatOrNull()
+                    ?: 0f
+            val rawHeight =
+                retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)
+                    ?.toFloatOrNull()
+                    ?: 0f
+            if (rawWidth <= 0f || rawHeight <= 0f) {
+                return null
+            }
+
+            val rotation =
+                retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)
+                    ?.toIntOrNull()
+                    ?: 0
+            val (displayWidth, displayHeight) = if (rotation == 90 || rotation == 270) {
+                rawHeight to rawWidth
+            } else {
+                rawWidth to rawHeight
+            }
+            (displayWidth / displayHeight).takeIf { it.isFinite() && it > 0f }
         } catch (_: Throwable) {
             null
         } finally {

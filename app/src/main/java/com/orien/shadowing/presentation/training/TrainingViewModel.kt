@@ -49,6 +49,8 @@ data class TrainingUiState(
     val isTranscribing: Boolean = false,
     val recognizedText: String? = null,
     val compareResult: TextCompareUseCase.CompareResult? = null,
+    val wordFeedback: List<TargetWordFeedback> = emptyList(),
+    val pronunciationHints: List<WordPronunciationHint> = emptyList(),
     val latestResult: SentenceLatestResultEntity? = null,
     val recordingPath: String? = null,
     val playbackSpeed: Float = 1.0f,
@@ -69,7 +71,7 @@ class TrainingViewModel @Inject constructor(
     private val audioPlayer: AudioPlayer,
     private val audioRecorder: AudioRecorder,
     moonshineAsrFactory: MoonshineAsrFactory,
-    private val textCompare: TextCompareUseCase
+    private val trainingFeedbackComposer: TrainingFeedbackComposer
 ) : ViewModel() {
     private data class PlaybackSource(
         val filePath: String,
@@ -229,7 +231,11 @@ class TrainingViewModel @Inject constructor(
                     _events.emit(TrainingEvent.ShowMessage(asrResult.errorMessage))
                     return@launch
                 }
-                val compareResult = textCompare.compare(sentence.textOriginal, asrResult.text)
+                val feedbackResult = trainingFeedbackComposer.evaluate(
+                    targetText = sentence.textOriginal,
+                    recognizedText = asrResult.text
+                )
+                val compareResult = feedbackResult.compareResult
                 val errorTagsJson = buildErrorTags(compareResult)
 
                 val recordId = practiceRepository.savePracticeResult(
@@ -253,6 +259,8 @@ class TrainingViewModel @Inject constructor(
                         isTranscribing = false,
                         recognizedText = asrResult.text,
                         compareResult = compareResult,
+                        wordFeedback = feedbackResult.wordFeedback,
+                        pronunciationHints = feedbackResult.pronunciationHints,
                         latestResult = latestResult,
                         recordingPath = recordingPath,
                         errorMessage = null
@@ -351,6 +359,8 @@ class TrainingViewModel @Inject constructor(
                     videoAspectRatio = videoAspectRatio,
                     recognizedText = null,
                     compareResult = null,
+                    wordFeedback = emptyList(),
+                    pronunciationHints = emptyList(),
                     latestResult = latestResult,
                     recordingPath = null,
                     errorMessage = null

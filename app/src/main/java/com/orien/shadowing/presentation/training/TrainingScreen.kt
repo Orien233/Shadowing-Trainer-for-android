@@ -52,10 +52,12 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
-import com.orien.shadowing.domain.usecase.TextCompareUseCase
 import com.orien.shadowing.presentation.components.rememberAudioPermission
 import kotlinx.coroutines.flow.collect
 
@@ -110,7 +112,10 @@ fun TrainingScreen(
                         )
                         Spacer(modifier = Modifier.height(8.dp))
                         Text(
-                            text = sentence.textOriginal,
+                            text = buildTargetSentenceAnnotatedString(
+                                sentence = sentence.textOriginal,
+                                wordFeedback = state.wordFeedback
+                            ),
                             style = MaterialTheme.typography.headlineSmall,
                             fontWeight = FontWeight.Medium
                         )
@@ -185,10 +190,10 @@ fun TrainingScreen(
                     )
                 }
 
-                if (state.recognizedText != null || state.compareResult != null) {
+                if (state.compareResult != null) {
                     ResultPanel(
-                        recognizedText = state.recognizedText,
-                        compareResult = state.compareResult
+                        compareResult = state.compareResult,
+                        pronunciationHints = state.pronunciationHints
                     )
                 }
 
@@ -206,7 +211,7 @@ fun TrainingScreen(
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
                             Text(
-                                text = "${latest.latestRecognizedText} (${(latest.latestScore * 100).toInt()}%)",
+                                text = "Score ${(latest.latestScore * 100).toInt()}%",
                                 style = MaterialTheme.typography.bodySmall
                             )
                         }
@@ -406,66 +411,96 @@ private fun RecordingControls(
 
 @Composable
 private fun ResultPanel(
-    recognizedText: String?,
-    compareResult: TextCompareUseCase.CompareResult?
+    compareResult: com.orien.shadowing.domain.usecase.TextCompareUseCase.CompareResult?,
+    pronunciationHints: List<WordPronunciationHint>
 ) {
+    compareResult ?: return
+
     Card(modifier = Modifier.fillMaxWidth()) {
         Column(modifier = Modifier.padding(16.dp)) {
-            Text("Recognition result", style = MaterialTheme.typography.labelMedium)
+            Text("Pronunciation feedback", style = MaterialTheme.typography.labelMedium)
             Spacer(modifier = Modifier.height(8.dp))
+            val scorePercent = (compareResult.matchScore * 100).toInt()
+            Text(
+                text = "Match score: $scorePercent%",
+                style = MaterialTheme.typography.titleMedium,
+                color = when {
+                    compareResult.matchScore >= 0.8f -> MaterialTheme.colorScheme.primary
+                    compareResult.matchScore >= 0.6f -> Color(0xFFE68619)
+                    else -> MaterialTheme.colorScheme.error
+                }
+            )
 
-            recognizedText?.let { text ->
+            if (pronunciationHints.isEmpty()) {
+                Spacer(modifier = Modifier.height(8.dp))
                 Text(
-                    text = if (text.isBlank()) "(No speech recognized)" else text,
-                    style = MaterialTheme.typography.bodyLarge
-                )
-            }
-
-            compareResult?.let { result ->
-                Spacer(modifier = Modifier.height(12.dp))
-
-                val scorePercent = (result.matchScore * 100).toInt()
-                Text(
-                    text = "Match score: $scorePercent%",
-                    style = MaterialTheme.typography.titleMedium,
-                    color = when {
-                        result.matchScore >= 0.8f -> MaterialTheme.colorScheme.primary
-                        result.matchScore >= 0.6f -> MaterialTheme.colorScheme.tertiary
-                        else -> MaterialTheme.colorScheme.error
-                    }
-                )
-
-                Text(
-                    text = result.simpleFeedback,
+                    text = if (compareResult.matchScore >= 0.95f) {
+                        "No word-level pronunciation hints for this attempt."
+                    } else {
+                        "No clear word-level hint yet. Try another recording."
+                    },
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
-
-                if (result.missedWords.isNotEmpty()) {
-                    Spacer(modifier = Modifier.height(4.dp))
+            } else {
+                Spacer(modifier = Modifier.height(12.dp))
+                pronunciationHints.forEachIndexed { index, hint ->
+                    if (index > 0) {
+                        Spacer(modifier = Modifier.height(12.dp))
+                    }
                     Text(
-                        text = "Missed: ${result.missedWords.joinToString(", ")}",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.error
+                        text = "${hint.targetWord} ${hint.targetIpa}",
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.SemiBold,
+                        color = colorForWordStatus(hint.status)
                     )
-                }
-                if (result.extraWords.isNotEmpty()) {
+                    Spacer(modifier = Modifier.height(2.dp))
                     Text(
-                        text = "Extra: ${result.extraWords.joinToString(", ")}",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.tertiary
-                    )
-                }
-                if (result.wrongWords.isNotEmpty()) {
-                    Text(
-                        text = "Wrong: ${result.wrongWords.joinToString(", ")}",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.error
+                        text = hint.message,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
             }
         }
     }
+}
+
+@Composable
+private fun buildTargetSentenceAnnotatedString(
+    sentence: String,
+    wordFeedback: List<TargetWordFeedback>
+) = buildAnnotatedString {
+    var wordIndex = 0
+    var previousWordStatus: TrainingWordStatus? = null
+
+    SentenceWordTokenizer.tokenize(sentence).forEach { chunk ->
+        if (chunk.isWord) {
+            val status = wordFeedback.getOrNull(wordIndex)?.status ?: TrainingWordStatus.UNKNOWN
+            withStyle(SpanStyle(color = colorForWordStatus(status))) {
+                append(chunk.text)
+            }
+            previousWordStatus = status
+            wordIndex++
+        } else {
+            val separatorColor = if (previousWordStatus != null) {
+                colorForWordStatus(previousWordStatus)
+            } else {
+                MaterialTheme.colorScheme.onSurface
+            }
+            withStyle(SpanStyle(color = separatorColor)) {
+                append(chunk.text)
+            }
+        }
+    }
+}
+
+@Composable
+private fun colorForWordStatus(status: TrainingWordStatus): Color = when (status) {
+    TrainingWordStatus.CORRECT -> Color(0xFF2E9B57)
+    TrainingWordStatus.NEEDS_IMPROVEMENT -> Color(0xFFE68619)
+    TrainingWordStatus.WRONG_OR_MISSING -> MaterialTheme.colorScheme.error
+    TrainingWordStatus.UNKNOWN -> MaterialTheme.colorScheme.onSurfaceVariant
 }
 
 @Composable

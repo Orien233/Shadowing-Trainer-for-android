@@ -8,6 +8,9 @@ import com.orien.shadowing.data.local.AudioRecorder
 import com.orien.shadowing.data.local.db.AppDatabase
 import com.orien.shadowing.data.local.db.MIGRATION_1_2
 import com.orien.shadowing.data.local.dao.*
+import com.orien.shadowing.data.local.g2p.AssetG2pDictionary
+import com.orien.shadowing.data.local.g2p.G2pDictionary
+import com.orien.shadowing.data.local.g2p.G2pService
 import dagger.Module
 import dagger.Provides
 import dagger.hilt.InstallIn
@@ -57,4 +60,16 @@ object AppModule {
     @Singleton
     fun provideAudioRecorder(@ApplicationContext context: Context): AudioRecorder =
         AudioRecorder(context)
+
+    // --- G2P ---
+
+    @Provides
+    @Singleton
+    fun provideG2pDictionary(@ApplicationContext context: Context): G2pDictionary =
+        AssetG2pDictionary(context)
+
+    @Provides
+    @Singleton
+    fun provideG2pService(dictionary: G2pDictionary): G2pService =
+        G2pService(dictionary)
 }

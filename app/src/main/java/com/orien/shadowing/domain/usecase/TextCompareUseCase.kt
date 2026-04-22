@@ -11,20 +11,25 @@ class TextCompareUseCase @Inject constructor() {
         val missedWords: List<String>,
         val extraWords: List<String>,
         val wrongWords: List<String>,
-        val simpleFeedback: String
+        val simpleFeedback: String,
+        val targetWords: List<String> = emptyList(),
+        val recognizedWords: List<String> = emptyList(),
+        val wordAlignments: List<WordAlignment> = emptyList()
     )
 
-    private enum class OpType {
+    enum class AlignmentType {
         Match,
         Replace,
         Delete,
         Insert
     }
 
-    private data class Op(
-        val type: OpType,
-        val target: String? = null,
-        val recognized: String? = null
+    data class WordAlignment(
+        val type: AlignmentType,
+        val targetIndex: Int? = null,
+        val targetWord: String? = null,
+        val recognizedIndex: Int? = null,
+        val recognizedWord: String? = null
     )
 
     fun compare(target: String, recognized: String): CompareResult {
@@ -41,16 +46,25 @@ class TextCompareUseCase @Inject constructor() {
                     "Perfect."
                 } else {
                     "Target sentence is empty, but speech was detected."
+                },
+                targetWords = targetTokens,
+                recognizedWords = recognizedTokens,
+                wordAlignments = recognizedTokens.mapIndexed { index, word ->
+                    WordAlignment(
+                        type = AlignmentType.Insert,
+                        recognizedIndex = index,
+                        recognizedWord = word
+                    )
                 }
             )
         }
 
         val operations = align(targetTokens, recognizedTokens)
-        val matchedWords = operations.count { it.type == OpType.Match }
-        val missedWords = operations.filter { it.type == OpType.Delete }.mapNotNull { it.target }
-        val extraWords = operations.filter { it.type == OpType.Insert }.mapNotNull { it.recognized }
-        val wrongWords = operations.filter { it.type == OpType.Replace }.map {
-            "${it.recognized ?: ""} -> ${it.target ?: ""}"
+        val matchedWords = operations.count { it.type == AlignmentType.Match }
+        val missedWords = operations.filter { it.type == AlignmentType.Delete }.mapNotNull { it.targetWord }
+        val extraWords = operations.filter { it.type == AlignmentType.Insert }.mapNotNull { it.recognizedWord }
+        val wrongWords = operations.filter { it.type == AlignmentType.Replace }.map {
+            "${it.recognizedWord ?: ""} -> ${it.targetWord ?: ""}"
         }
 
         val matchScore = matchedWords.toFloat() / targetTokens.size.coerceAtLeast(1)
@@ -59,17 +73,22 @@ class TextCompareUseCase @Inject constructor() {
             missedWords = missedWords,
             extraWords = extraWords,
             wrongWords = wrongWords,
-            simpleFeedback = buildFeedback(matchScore, missedWords, extraWords, wrongWords)
+            simpleFeedback = buildFeedback(matchScore, missedWords, extraWords, wrongWords),
+            targetWords = targetTokens,
+            recognizedWords = recognizedTokens,
+            wordAlignments = operations
         )
     }
 
     private fun normalize(text: String): List<String> =
         text.lowercase()
-            .replace(Regex("[^a-z\\s']"), " ")
+            .replace(Regex("[\\u2018\\u2019\\u201b\\u2032\\u02bc]"), "'")
+            .replace(Regex("[\\u2010\\u2011\\u2012\\u2013\\u2014\\u2212]"), " ")
+            .replace(Regex("[^a-z0-9\\s']"), " ")
             .split(Regex("\\s+"))
             .filter { it.isNotBlank() }
 
-    private fun align(target: List<String>, recognized: List<String>): List<Op> {
+    private fun align(target: List<String>, recognized: List<String>): List<WordAlignment> {
         val rows = target.size + 1
         val cols = recognized.size + 1
         val dp = Array(rows) { IntArray(cols) }
@@ -95,30 +114,58 @@ class TextCompareUseCase @Inject constructor() {
             }
         }
 
-        val operations = mutableListOf<Op>()
+        val operations = mutableListOf<WordAlignment>()
         var row = target.size
         var col = recognized.size
         while (row > 0 || col > 0) {
             when {
                 row > 0 && col > 0 && target[row - 1] == recognized[col - 1] -> {
-                    operations.add(Op(OpType.Match, target[row - 1], recognized[col - 1]))
+                    operations.add(
+                        WordAlignment(
+                            type = AlignmentType.Match,
+                            targetIndex = row - 1,
+                            targetWord = target[row - 1],
+                            recognizedIndex = col - 1,
+                            recognizedWord = recognized[col - 1]
+                        )
+                    )
                     row--
                     col--
                 }
 
                 row > 0 && col > 0 && dp[row][col] == dp[row - 1][col - 1] + 1 -> {
-                    operations.add(Op(OpType.Replace, target[row - 1], recognized[col - 1]))
+                    operations.add(
+                        WordAlignment(
+                            type = AlignmentType.Replace,
+                            targetIndex = row - 1,
+                            targetWord = target[row - 1],
+                            recognizedIndex = col - 1,
+                            recognizedWord = recognized[col - 1]
+                        )
+                    )
                     row--
                     col--
                 }
 
                 row > 0 && dp[row][col] == dp[row - 1][col] + 1 -> {
-                    operations.add(Op(OpType.Delete, target[row - 1], null))
+                    operations.add(
+                        WordAlignment(
+                            type = AlignmentType.Delete,
+                            targetIndex = row - 1,
+                            targetWord = target[row - 1]
+                        )
+                    )
                     row--
                 }
 
                 else -> {
-                    operations.add(Op(OpType.Insert, null, recognized[col - 1]))
+                    operations.add(
+                        WordAlignment(
+                            type = AlignmentType.Insert,
+                            recognizedIndex = col - 1,
+                            recognizedWord = recognized[col - 1]
+                        )
+                    )
                     col--
                 }
             }

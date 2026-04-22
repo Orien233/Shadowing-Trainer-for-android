@@ -13,6 +13,14 @@ import com.orien.shadowing.data.model.PracticeRecordEntity
 import com.orien.shadowing.data.model.SentenceEntity
 import com.orien.shadowing.data.model.SentenceLatestResultEntity
 
+val MIGRATION_1_2 = object : Migration(1, 2) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL(
+            "ALTER TABLE materials ADD COLUMN fallbackAudioPath TEXT"
+        )
+    }
+}
+
 @Database(
     entities = [
         MaterialEntity::class,
@@ -28,14 +36,4 @@ abstract class AppDatabase : RoomDatabase() {
     abstract fun sentenceDao(): SentenceDao
     abstract fun practiceRecordDao(): PracticeRecordDao
     abstract fun sentenceLatestResultDao(): SentenceLatestResultDao
-
-    companion object {
-        val MIGRATION_1_2 = object : Migration(1, 2) {
-            override fun migrate(db: SupportSQLiteDatabase) {
-                db.execSQL(
-                    "ALTER TABLE materials ADD COLUMN fallbackAudioPath TEXT"
-                )
-            }
-        }
-    }
 }

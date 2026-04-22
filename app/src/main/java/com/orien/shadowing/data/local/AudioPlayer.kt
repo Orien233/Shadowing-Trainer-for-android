@@ -1,13 +1,16 @@
 package com.orien.shadowing.data.local
 
 import android.content.Context
+import android.media.MediaPlayer
 import android.net.Uri
+import android.view.SurfaceHolder
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
+import com.orien.shadowing.data.local.media.MediaTranscodeLimits
 import com.orien.shadowing.data.local.moonshine.AudioUtils
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.CoroutineScope
@@ -25,6 +28,11 @@ import java.io.File
 import javax.inject.Inject
 import javax.inject.Singleton
 
+enum class VideoPlaybackEngine {
+    EXO_PLAYER,
+    MEDIA_PLAYER
+}
+
 /**
  * ExoPlayer-backed audio playback helper.
  */
@@ -38,6 +46,9 @@ class AudioPlayer @Inject constructor(
     )
 
     private var player: ExoPlayer? = null
+    private var mediaPlayer: MediaPlayer? = null
+    private var mediaPlayerPrepared = false
+    private var mediaPlayerSurfaceHolder: SurfaceHolder? = null
     private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
     private val playbackScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
@@ -63,10 +74,8 @@ class AudioPlayer @Inject constructor(
     private var retriedTranscodedAudioForCurrentMedia: Boolean = false
     private var transcodeRecoveryJob: Job? = null
     private val fallbackAudioCache = mutableMapOf<String, String>()
-
-    companion object {
-        private const val MAX_ON_DEMAND_FULL_FALLBACK_DURATION_MS = 120_000L
-    }
+    private var activeVideoPlaybackEngine: VideoPlaybackEngine = VideoPlaybackEngine.EXO_PLAYER
+    private var currentPlaybackSpeed: Float = 1.0f
 
     fun init() {
         if (player != null) {
@@ -74,8 +83,12 @@ class AudioPlayer @Inject constructor(
         }
 
         player = ExoPlayer.Builder(context).build().apply {
+            playbackParameters = PlaybackParameters(currentPlaybackSpeed)
             addListener(object : Player.Listener {
                 override fun onIsPlayingChanged(isPlayingNow: Boolean) {
+                    if (activeVideoPlaybackEngine != VideoPlaybackEngine.EXO_PLAYER) {
+                        return
+                    }
                     _isPlaying.value = isPlayingNow
                     if (isPlayingNow) {
                         startPositionUpdates()
@@ -85,6 +98,9 @@ class AudioPlayer @Inject constructor(
                 }
 
                 override fun onPlaybackStateChanged(playbackState: Int) {
+                    if (activeVideoPlaybackEngine != VideoPlaybackEngine.EXO_PLAYER) {
+                        return
+                    }
                     if (playbackState == Player.STATE_READY) {
                         _durationMs.value = duration.coerceAtLeast(0L)
                     }
@@ -94,6 +110,9 @@ class AudioPlayer @Inject constructor(
                 }
 
                 override fun onPlayerError(error: PlaybackException) {
+                    if (activeVideoPlaybackEngine != VideoPlaybackEngine.EXO_PLAYER) {
+                        return
+                    }
                     _isPlaying.value = false
                     if (tryRecoverWithAudioOnly(this@apply)) {
                         return
@@ -118,7 +137,9 @@ class AudioPlayer @Inject constructor(
         startTimeMs: Long?,
         endTimeMs: Long?,
         loop: Boolean = false,
-        fallbackAudioPath: String? = null
+        fallbackAudioPath: String? = null,
+        isVideo: Boolean = false,
+        videoPlaybackEngine: VideoPlaybackEngine = VideoPlaybackEngine.EXO_PLAYER
     ) {
         init()
         val exoPlayer = player ?: return
@@ -144,6 +165,15 @@ class AudioPlayer @Inject constructor(
         transcodeRecoveryJob?.cancel()
         transcodeRecoveryJob = null
 
+        if (isVideo && videoPlaybackEngine == VideoPlaybackEngine.MEDIA_PLAYER) {
+            activeVideoPlaybackEngine = VideoPlaybackEngine.MEDIA_PLAYER
+            stopExoPlayback()
+            playWithMediaPlayer(uri)
+            return
+        }
+
+        activeVideoPlaybackEngine = VideoPlaybackEngine.EXO_PLAYER
+        resetMediaPlayer()
         exoPlayer.repeatMode = if (endTimeMs == null && loop) {
             Player.REPEAT_MODE_ONE
         } else {
@@ -166,27 +196,72 @@ class AudioPlayer @Inject constructor(
         return checkNotNull(player)
     }
 
+    fun bindMediaPlayerSurface(holder: SurfaceHolder) {
+        mediaPlayerSurfaceHolder = holder
+        mediaPlayer?.setDisplay(holder)
+    }
+
+    fun unbindMediaPlayerSurface(holder: SurfaceHolder) {
+        if (mediaPlayerSurfaceHolder === holder) {
+            mediaPlayerSurfaceHolder = null
+            mediaPlayer?.setDisplay(null)
+        }
+    }
+
     fun pause() {
-        player?.pause()
+        when (activeVideoPlaybackEngine) {
+            VideoPlaybackEngine.MEDIA_PLAYER -> {
+                val liveMediaPlayer = mediaPlayer
+                if (mediaPlayerPrepared && liveMediaPlayer?.isPlaying == true) {
+                    liveMediaPlayer.pause()
+                    _isPlaying.value = false
+                    stopPositionUpdates()
+                }
+            }
+            VideoPlaybackEngine.EXO_PLAYER -> player?.pause()
+        }
     }
 
     fun resume() {
-        player?.play()
+        when (activeVideoPlaybackEngine) {
+            VideoPlaybackEngine.MEDIA_PLAYER -> {
+                val liveMediaPlayer = mediaPlayer
+                if (mediaPlayerPrepared && liveMediaPlayer != null) {
+                    liveMediaPlayer.start()
+                    _isPlaying.value = true
+                    startPositionUpdates()
+                }
+            }
+            VideoPlaybackEngine.EXO_PLAYER -> player?.play()
+        }
     }
 
     fun stop() {
-        player?.stop()
+        when (activeVideoPlaybackEngine) {
+            VideoPlaybackEngine.MEDIA_PLAYER -> resetMediaPlayer()
+            VideoPlaybackEngine.EXO_PLAYER -> player?.stop()
+        }
         clearSegmentState()
         _isPlaying.value = false
         _currentPositionMs.value = 0L
+        _durationMs.value = 0L
     }
 
     fun seekTo(positionMs: Long) {
-        player?.seekTo(positionMs)
+        when (activeVideoPlaybackEngine) {
+            VideoPlaybackEngine.MEDIA_PLAYER -> {
+                if (mediaPlayerPrepared) {
+                    mediaPlayer?.seekTo(positionMs.toInt())
+                }
+            }
+            VideoPlaybackEngine.EXO_PLAYER -> player?.seekTo(positionMs)
+        }
     }
 
     fun setPlaybackSpeed(speed: Float) {
+        currentPlaybackSpeed = speed
         player?.playbackParameters = PlaybackParameters(speed)
+        applyMediaPlayerPlaybackSpeed(mediaPlayer)
     }
 
     fun release() {
@@ -194,30 +269,31 @@ class AudioPlayer @Inject constructor(
         clearSegmentState()
         player?.release()
         player = null
+        releaseMediaPlayer()
     }
 
     private fun startPositionUpdates() {
         stopPositionUpdates()
         positionUpdateRunnable = object : Runnable {
             override fun run() {
-                val exoPlayer = player ?: return
-                val currentPosition = exoPlayer.currentPosition.coerceAtLeast(0L)
+                val currentPosition = getCurrentPlaybackPositionMs() ?: return
                 _currentPositionMs.value = currentPosition
 
                 val endMs = segmentEndMs
                 if (endMs != null && currentPosition >= endMs) {
                     if (loopSegment) {
-                        exoPlayer.seekTo(segmentStartMs)
-                        exoPlayer.playWhenReady = true
+                        restartSegmentPlayback()
                     } else {
-                        exoPlayer.pause()
-                        exoPlayer.seekTo(segmentStartMs)
+                        pauseActivePlayback()
+                        seekActivePlayback(segmentStartMs)
+                        stopPositionUpdates()
+                        _isPlaying.value = false
                         clearSegmentState()
                         return
                     }
                 }
 
-                if (exoPlayer.isPlaying) {
+                if (isPlaybackRunning()) {
                     mainHandler.postDelayed(this, 100L)
                 }
             }
@@ -241,6 +317,144 @@ class AudioPlayer @Inject constructor(
         transcodeRecoveryJob?.cancel()
         transcodeRecoveryJob = null
         player?.repeatMode = Player.REPEAT_MODE_OFF
+    }
+
+    private fun getCurrentPlaybackPositionMs(): Long? {
+        return when (activeVideoPlaybackEngine) {
+            VideoPlaybackEngine.MEDIA_PLAYER -> {
+                if (mediaPlayerPrepared) {
+                    mediaPlayer?.currentPosition?.toLong()?.coerceAtLeast(0L)
+                } else {
+                    null
+                }
+            }
+            VideoPlaybackEngine.EXO_PLAYER -> player?.currentPosition?.coerceAtLeast(0L)
+        }
+    }
+
+    private fun isPlaybackRunning(): Boolean {
+        return when (activeVideoPlaybackEngine) {
+            VideoPlaybackEngine.MEDIA_PLAYER -> mediaPlayerPrepared && mediaPlayer?.isPlaying == true
+            VideoPlaybackEngine.EXO_PLAYER -> player?.isPlaying == true
+        }
+    }
+
+    private fun restartSegmentPlayback() {
+        seekActivePlayback(segmentStartMs)
+        when (activeVideoPlaybackEngine) {
+            VideoPlaybackEngine.MEDIA_PLAYER -> {
+                if (mediaPlayerPrepared) {
+                    mediaPlayer?.start()
+                    _isPlaying.value = true
+                }
+            }
+            VideoPlaybackEngine.EXO_PLAYER -> player?.playWhenReady = true
+        }
+    }
+
+    private fun seekActivePlayback(positionMs: Long) {
+        when (activeVideoPlaybackEngine) {
+            VideoPlaybackEngine.MEDIA_PLAYER -> {
+                if (mediaPlayerPrepared) {
+                    mediaPlayer?.seekTo(positionMs.toInt())
+                }
+            }
+            VideoPlaybackEngine.EXO_PLAYER -> player?.seekTo(positionMs)
+        }
+    }
+
+    private fun pauseActivePlayback() {
+        when (activeVideoPlaybackEngine) {
+            VideoPlaybackEngine.MEDIA_PLAYER -> {
+                if (mediaPlayerPrepared && mediaPlayer?.isPlaying == true) {
+                    mediaPlayer?.pause()
+                }
+            }
+            VideoPlaybackEngine.EXO_PLAYER -> player?.pause()
+        }
+    }
+
+    private fun stopExoPlayback() {
+        player?.apply {
+            stop()
+            repeatMode = Player.REPEAT_MODE_OFF
+        }
+    }
+
+    private fun resetMediaPlayer() {
+        stopPositionUpdates()
+        runCatching { mediaPlayer?.reset() }
+        mediaPlayerPrepared = false
+    }
+
+    private fun releaseMediaPlayer() {
+        stopPositionUpdates()
+        runCatching { mediaPlayer?.release() }
+        mediaPlayer = null
+        mediaPlayerPrepared = false
+        mediaPlayerSurfaceHolder = null
+    }
+
+    private fun playWithMediaPlayer(uri: Uri) {
+        val liveMediaPlayer = mediaPlayer ?: MediaPlayer().apply {
+            setOnPreparedListener { preparedPlayer ->
+                if (activeVideoPlaybackEngine != VideoPlaybackEngine.MEDIA_PLAYER) {
+                    return@setOnPreparedListener
+                }
+                mediaPlayerPrepared = true
+                _durationMs.value = preparedPlayer.duration.coerceAtLeast(0).toLong()
+                applyMediaPlayerPlaybackSpeed(preparedPlayer)
+                preparedPlayer.isLooping = segmentEndMs == null && loopSegment
+                if (segmentStartMs > 0L) {
+                    preparedPlayer.seekTo(segmentStartMs.toInt())
+                }
+                preparedPlayer.start()
+                _isPlaying.value = true
+                startPositionUpdates()
+            }
+            setOnCompletionListener {
+                if (activeVideoPlaybackEngine != VideoPlaybackEngine.MEDIA_PLAYER) {
+                    return@setOnCompletionListener
+                }
+                _isPlaying.value = false
+                stopPositionUpdates()
+            }
+            setOnErrorListener { _, _, _ ->
+                if (activeVideoPlaybackEngine != VideoPlaybackEngine.MEDIA_PLAYER) {
+                    return@setOnErrorListener true
+                }
+                _isPlaying.value = false
+                stopPositionUpdates()
+                _playbackMessages.tryEmit("Unable to play this video with MediaPlayer.")
+                true
+            }
+        }.also { createdPlayer ->
+            mediaPlayer = createdPlayer
+        }
+
+        stopPositionUpdates()
+        mediaPlayerPrepared = false
+        runCatching {
+            liveMediaPlayer.reset()
+            mediaPlayerSurfaceHolder?.let(liveMediaPlayer::setDisplay)
+            liveMediaPlayer.setDataSource(context, uri)
+            liveMediaPlayer.prepareAsync()
+        }.onFailure { error ->
+            _isPlaying.value = false
+            _playbackMessages.tryEmit(
+                error.message ?: "Unable to start MediaPlayer playback for this video."
+            )
+        }
+    }
+
+    private fun applyMediaPlayerPlaybackSpeed(liveMediaPlayer: MediaPlayer?) {
+        if (!mediaPlayerPrepared || liveMediaPlayer == null) {
+            return
+        }
+        runCatching {
+            val playbackParams = liveMediaPlayer.playbackParams ?: android.media.PlaybackParams()
+            liveMediaPlayer.playbackParams = playbackParams.setSpeed(currentPlaybackSpeed)
+        }
     }
 
     private fun tryRecoverWithAudioOnly(exoPlayer: ExoPlayer): Boolean {
@@ -372,7 +586,9 @@ class AudioPlayer @Inject constructor(
 
         if (!hasRequestedSegment) {
             val durationMs = AudioUtils.resolveMediaDurationMs(sourcePath)
-            if (durationMs != null && durationMs > MAX_ON_DEMAND_FULL_FALLBACK_DURATION_MS) {
+            if (durationMs != null &&
+                durationMs > MediaTranscodeLimits.PLAYBACK_ON_DEMAND_FULL_FALLBACK_LIMIT_MS
+            ) {
                 throw IllegalStateException(
                     "This media cannot be played directly on this device and is too long " +
                         "to build a full fallback audio track on demand."

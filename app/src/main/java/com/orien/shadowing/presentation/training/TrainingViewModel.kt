@@ -4,6 +4,7 @@ import android.media.MediaExtractor
 import android.media.MediaCodecList
 import android.media.MediaMetadataRetriever
 import android.util.Log
+import android.view.SurfaceHolder
 import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
@@ -11,6 +12,7 @@ import androidx.media3.exoplayer.ExoPlayer
 import com.orien.shadowing.data.local.AudioPlayer
 import com.orien.shadowing.data.local.AudioRecorder
 import com.orien.shadowing.data.local.MoonshineAsr
+import com.orien.shadowing.data.local.VideoPlaybackEngine
 import com.orien.shadowing.data.local.dao.SentenceDao
 import com.orien.shadowing.data.local.repository.MaterialRepository
 import com.orien.shadowing.data.local.repository.PracticeRepository
@@ -43,6 +45,7 @@ data class TrainingUiState(
     val playbackStartTimeMs: Long? = null,
     val playbackEndTimeMs: Long? = null,
     val hasVideoPlayback: Boolean = false,
+    val videoPlaybackEngine: VideoPlaybackEngine = VideoPlaybackEngine.EXO_PLAYER,
     val isPlaying: Boolean = false,
     val isRecording: Boolean = false,
     val isTranscribing: Boolean = false,
@@ -131,11 +134,29 @@ class TrainingViewModel @Inject constructor(
             startTimeMs = playbackSource.startTimeMs,
             endTimeMs = playbackSource.endTimeMs,
             loop = state.loopEnabled,
-            fallbackAudioPath = playbackSource.fallbackAudioPath
+            fallbackAudioPath = playbackSource.fallbackAudioPath,
+            isVideo = playbackSource.isVideo,
+            videoPlaybackEngine = state.videoPlaybackEngine
         )
     }
 
     fun getVideoPlayer(): ExoPlayer = audioPlayer.getPlayer()
+
+    fun bindMediaPlayerSurface(holder: SurfaceHolder) {
+        audioPlayer.bindMediaPlayerSurface(holder)
+    }
+
+    fun unbindMediaPlayerSurface(holder: SurfaceHolder) {
+        audioPlayer.unbindMediaPlayerSurface(holder)
+    }
+
+    fun useExoPlayerMode() {
+        switchVideoPlaybackEngine(VideoPlaybackEngine.EXO_PLAYER)
+    }
+
+    fun useMediaPlayerMode() {
+        switchVideoPlaybackEngine(VideoPlaybackEngine.MEDIA_PLAYER)
+    }
 
     fun pausePlayback() {
         audioPlayer.pause()
@@ -313,6 +334,19 @@ class TrainingViewModel @Inject constructor(
         moonshineAsr.release()
     }
 
+    private fun switchVideoPlaybackEngine(engine: VideoPlaybackEngine) {
+        if (_uiState.value.videoPlaybackEngine == engine) {
+            return
+        }
+        audioPlayer.stop()
+        _uiState.update {
+            it.copy(
+                videoPlaybackEngine = engine,
+                isPlaying = false
+            )
+        }
+    }
+
     private fun loadSentence(sentenceId: Long) {
         viewModelScope.launch {
             val sentence = sentenceDao.getSentenceById(sentenceId)
@@ -337,6 +371,11 @@ class TrainingViewModel @Inject constructor(
                     playbackStartTimeMs = playbackSource?.startTimeMs,
                     playbackEndTimeMs = playbackSource?.endTimeMs,
                     hasVideoPlayback = playbackSource?.isVideo == true,
+                    videoPlaybackEngine = if (playbackSource?.isVideo == true) {
+                        it.videoPlaybackEngine
+                    } else {
+                        VideoPlaybackEngine.EXO_PLAYER
+                    },
                     recognizedText = null,
                     compareResult = null,
                     latestResult = latestResult,

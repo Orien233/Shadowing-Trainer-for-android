@@ -1,11 +1,13 @@
 package com.orien.shadowing.di
 
 import android.content.Context
+import android.content.pm.ApplicationInfo
 import androidx.room.Room
 import com.orien.shadowing.data.local.AudioPlayer
 import com.orien.shadowing.data.local.AudioRecorder
 import com.orien.shadowing.data.local.MoonshineAsr
 import com.orien.shadowing.data.local.db.AppDatabase
+import com.orien.shadowing.data.local.db.MIGRATION_1_2
 import com.orien.shadowing.data.local.dao.*
 import dagger.Module
 import dagger.Provides
@@ -22,14 +24,23 @@ object AppModule {
 
     @Provides
     @Singleton
-    fun provideDatabase(@ApplicationContext context: Context): AppDatabase =
-        Room.databaseBuilder(
+    fun provideDatabase(@ApplicationContext context: Context): AppDatabase {
+        val isDebuggable = (context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0
+
+        return Room.databaseBuilder(
             context,
             AppDatabase::class.java,
             "shadowing.db"
         )
-            .addMigrations(AppDatabase.MIGRATION_1_2)
+            .addMigrations(MIGRATION_1_2)
+            .apply {
+                // Dev builds may bounce between APKs with different schema versions.
+                if (isDebuggable) {
+                    fallbackToDestructiveMigrationOnDowngrade()
+                }
+            }
             .build()
+    }
 
     @Provides fun provideMaterialDao(db: AppDatabase): MaterialDao = db.materialDao()
     @Provides fun provideSentenceDao(db: AppDatabase): SentenceDao = db.sentenceDao()

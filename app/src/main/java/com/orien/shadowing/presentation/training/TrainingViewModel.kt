@@ -27,7 +27,6 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collect
-import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.serialization.encodeToString
@@ -442,8 +441,7 @@ class TrainingViewModel @Inject constructor(
             }
 
             val material = materialRepository.getMaterial(materialId)
-            val allSentences = materialRepository.getSentences(materialId).first()
-            val sentenceIndex = allSentences.indexOfFirst { it.id == sentenceId }.coerceAtLeast(0)
+            val totalSentences = materialRepository.getSentenceCount(materialId)
             val latestResult = practiceRepository.getLatestResult(sentenceId)
             val playbackSource = resolvePlaybackSource(sentence, material)
             val videoAspectRatio = playbackSource
@@ -455,8 +453,8 @@ class TrainingViewModel @Inject constructor(
                 it.copy(
                     material = material,
                     sentence = sentence,
-                    sentenceIndex = sentenceIndex,
-                    totalSentences = allSentences.size,
+                    sentenceIndex = sentence.index.coerceAtLeast(0),
+                    totalSentences = totalSentences,
                     playbackSourcePath = playbackSource?.filePath,
                     playbackStartTimeMs = playbackSource?.startTimeMs,
                     playbackEndTimeMs = playbackSource?.endTimeMs,

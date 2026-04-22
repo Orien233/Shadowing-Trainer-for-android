@@ -9,7 +9,15 @@ import com.orien.shadowing.data.model.MaterialEntity
 import com.orien.shadowing.data.model.SentenceEntity
 import com.orien.shadowing.data.model.SentenceLatestResultEntity
 import dagger.hilt.android.lifecycle.HiltViewModel
-import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import javax.inject.Inject
 
@@ -38,22 +46,29 @@ class SentenceListViewModel @Inject constructor(
 
     private fun load() {
         viewModelScope.launch {
-            val material = materialRepository.getMaterial(materialId)
-            _uiState.update { it.copy(material = material) }
-        }
-
-        viewModelScope.launch {
-            materialRepository.getSentences(materialId).collect { sentences ->
-                _uiState.update { it.copy(sentences = sentences, isLoading = false) }
+            combine(
+                materialFlow(),
+                materialRepository.getSentences(materialId),
+                practiceRepository.getLatestResultsByMaterial(materialId)
+            ) { material, sentences, latestResults ->
+                Triple(material, sentences, latestResults)
             }
-        }
-
-        viewModelScope.launch {
-            practiceRepository.getLatestResultsByMaterial(materialId).collect { results ->
-                _uiState.update {
-                    it.copy(latestResults = results.associateBy { r -> r.sentenceId })
+                .map { (material, sentences, latestResults) ->
+                    SentenceListUiState(
+                        material = material,
+                        sentences = sentences,
+                        latestResults = latestResults.associateBy(SentenceLatestResultEntity::sentenceId),
+                        isLoading = false
+                    )
                 }
-            }
+                .flowOn(Dispatchers.Default)
+                .collect { state ->
+                    _uiState.value = state
+                }
         }
+    }
+
+    private fun materialFlow(): Flow<MaterialEntity?> = flow {
+        emit(materialRepository.getMaterial(materialId))
     }
 }

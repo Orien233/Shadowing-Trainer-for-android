@@ -93,10 +93,6 @@ dependencies {
     // DocumentFile (SAF directory access)
     implementation("androidx.documentfile:documentfile:1.0.1")
 
-    // Media3 (ExoPlayer)
-    implementation(libs.media3.exoplayer)
-    implementation(libs.media3.ui)
-
     // Testing
     testImplementation(libs.junit)
     testImplementation(libs.kotlinx.coroutines.test)

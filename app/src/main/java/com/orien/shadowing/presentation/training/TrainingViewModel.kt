@@ -1,18 +1,15 @@
 package com.orien.shadowing.presentation.training
 
 import android.media.MediaExtractor
-import android.media.MediaCodecList
 import android.media.MediaMetadataRetriever
 import android.util.Log
 import android.view.SurfaceHolder
 import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
-import androidx.media3.exoplayer.ExoPlayer
 import com.orien.shadowing.data.local.AudioPlayer
 import com.orien.shadowing.data.local.AudioRecorder
 import com.orien.shadowing.data.local.MoonshineAsr
-import com.orien.shadowing.data.local.VideoPlaybackEngine
 import com.orien.shadowing.data.local.dao.SentenceDao
 import com.orien.shadowing.data.local.repository.MaterialRepository
 import com.orien.shadowing.data.local.repository.PracticeRepository
@@ -45,7 +42,6 @@ data class TrainingUiState(
     val playbackStartTimeMs: Long? = null,
     val playbackEndTimeMs: Long? = null,
     val hasVideoPlayback: Boolean = false,
-    val videoPlaybackEngine: VideoPlaybackEngine = VideoPlaybackEngine.EXO_PLAYER,
     val isPlaying: Boolean = false,
     val isRecording: Boolean = false,
     val isTranscribing: Boolean = false,
@@ -90,7 +86,6 @@ class TrainingViewModel @Inject constructor(
     private val _events = MutableSharedFlow<TrainingEvent>()
     val events = _events.asSharedFlow()
     private val hasVideoTrackCache = mutableMapOf<String, Boolean>()
-    private val videoMimeSupportCache = mutableMapOf<String, Boolean>()
 
     companion object {
         private const val TAG = "TrainingViewModel"
@@ -134,28 +129,16 @@ class TrainingViewModel @Inject constructor(
             startTimeMs = playbackSource.startTimeMs,
             endTimeMs = playbackSource.endTimeMs,
             loop = state.loopEnabled,
-            fallbackAudioPath = playbackSource.fallbackAudioPath,
-            isVideo = playbackSource.isVideo,
-            videoPlaybackEngine = state.videoPlaybackEngine
+            fallbackAudioPath = playbackSource.fallbackAudioPath
         )
     }
 
-    fun getVideoPlayer(): ExoPlayer = audioPlayer.getPlayer()
-
-    fun bindMediaPlayerSurface(holder: SurfaceHolder) {
-        audioPlayer.bindMediaPlayerSurface(holder)
+    fun bindVideoSurface(holder: SurfaceHolder) {
+        audioPlayer.bindVideoSurface(holder)
     }
 
-    fun unbindMediaPlayerSurface(holder: SurfaceHolder) {
-        audioPlayer.unbindMediaPlayerSurface(holder)
-    }
-
-    fun useExoPlayerMode() {
-        switchVideoPlaybackEngine(VideoPlaybackEngine.EXO_PLAYER)
-    }
-
-    fun useMediaPlayerMode() {
-        switchVideoPlaybackEngine(VideoPlaybackEngine.MEDIA_PLAYER)
+    fun unbindVideoSurface(holder: SurfaceHolder) {
+        audioPlayer.unbindVideoSurface(holder)
     }
 
     fun pausePlayback() {
@@ -334,19 +317,6 @@ class TrainingViewModel @Inject constructor(
         moonshineAsr.release()
     }
 
-    private fun switchVideoPlaybackEngine(engine: VideoPlaybackEngine) {
-        if (_uiState.value.videoPlaybackEngine == engine) {
-            return
-        }
-        audioPlayer.stop()
-        _uiState.update {
-            it.copy(
-                videoPlaybackEngine = engine,
-                isPlaying = false
-            )
-        }
-    }
-
     private fun loadSentence(sentenceId: Long) {
         viewModelScope.launch {
             val sentence = sentenceDao.getSentenceById(sentenceId)
@@ -371,11 +341,6 @@ class TrainingViewModel @Inject constructor(
                     playbackStartTimeMs = playbackSource?.startTimeMs,
                     playbackEndTimeMs = playbackSource?.endTimeMs,
                     hasVideoPlayback = playbackSource?.isVideo == true,
-                    videoPlaybackEngine = if (playbackSource?.isVideo == true) {
-                        it.videoPlaybackEngine
-                    } else {
-                        VideoPlaybackEngine.EXO_PLAYER
-                    },
                     recognizedText = null,
                     compareResult = null,
                     latestResult = latestResult,
@@ -513,25 +478,17 @@ class TrainingViewModel @Inject constructor(
             extractor.setDataSource(localPath)
             var hasAudioTrack = false
             var hasAnyVideoTrack = false
-            var hasSupportedVideoTrack = false
             for (index in 0 until extractor.trackCount) {
                 val mime = extractor.getTrackFormat(index).getString(android.media.MediaFormat.KEY_MIME)
                 when {
-                    mime?.startsWith("video/") == true -> {
-                        hasAnyVideoTrack = true
-                        if (isVideoMimeSupported(mime)) {
-                            hasSupportedVideoTrack = true
-                        }
-                    }
+                    mime?.startsWith("video/") == true -> hasAnyVideoTrack = true
                     mime?.startsWith("audio/") == true -> hasAudioTrack = true
                 }
-                if (hasSupportedVideoTrack) {
-                    break
+                if (hasAnyVideoTrack) {
+                    return true
                 }
             }
             when {
-                hasSupportedVideoTrack -> return true
-                hasAnyVideoTrack && hasAudioTrack -> return false
                 hasAnyVideoTrack -> return true
                 hasAudioTrack -> return false
             }
@@ -565,24 +522,6 @@ class TrainingViewModel @Inject constructor(
         } finally {
             runCatching { retriever.release() }
         }
-    }
-
-    private fun isVideoMimeSupported(mime: String): Boolean {
-        val cached = videoMimeSupportCache[mime]
-        if (cached != null) {
-            return cached
-        }
-        val supported = runCatching {
-            MediaCodecList(MediaCodecList.REGULAR_CODECS)
-                .codecInfos
-                .any { info ->
-                    !info.isEncoder && info.supportedTypes.any { type ->
-                        type.equals(mime, ignoreCase = true)
-                    }
-                }
-        }.getOrDefault(false)
-        videoMimeSupportCache[mime] = supported
-        return supported
     }
 
     private fun buildErrorTags(compareResult: TextCompareUseCase.CompareResult): String? {

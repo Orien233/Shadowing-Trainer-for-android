@@ -3,53 +3,45 @@ package com.orien.shadowing.data.local
 import android.content.Context
 import android.media.MediaPlayer
 import android.net.Uri
+import android.os.Handler
+import android.os.Looper
 import android.view.SurfaceHolder
-import androidx.media3.common.C
-import androidx.media3.common.MediaItem
-import androidx.media3.common.PlaybackException
-import androidx.media3.common.PlaybackParameters
-import androidx.media3.common.Player
-import androidx.media3.exoplayer.ExoPlayer
 import com.orien.shadowing.data.local.media.MediaTranscodeLimits
 import com.orien.shadowing.data.local.moonshine.AudioUtils
 import dagger.hilt.android.qualifiers.ApplicationContext
+import java.io.File
+import javax.inject.Inject
+import javax.inject.Singleton
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.asSharedFlow
-import java.io.File
-import javax.inject.Inject
-import javax.inject.Singleton
-
-enum class VideoPlaybackEngine {
-    EXO_PLAYER,
-    MEDIA_PLAYER
-}
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 
 /**
- * ExoPlayer-backed audio playback helper.
+ * MediaPlayer-backed media playback helper.
  */
 @Singleton
 class AudioPlayer @Inject constructor(
     @ApplicationContext private val context: Context
 ) {
     private data class FallbackAudioAsset(
-        val path: String,
-        val coversOnlyRequestedSegment: Boolean
+        val uri: Uri,
+        val coversOnlyRequestedSegment: Boolean,
+        val preGenerated: Boolean
     )
 
-    private var player: ExoPlayer? = null
     private var mediaPlayer: MediaPlayer? = null
     private var mediaPlayerPrepared = false
-    private var mediaPlayerSurfaceHolder: SurfaceHolder? = null
-    private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private var videoSurfaceHolder: SurfaceHolder? = null
+    private val mainHandler = Handler(Looper.getMainLooper())
     private val playbackScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     private val _isPlaying = MutableStateFlow(false)
@@ -67,68 +59,61 @@ class AudioPlayer @Inject constructor(
     private var positionUpdateRunnable: Runnable? = null
     private var segmentStartMs: Long = 0L
     private var segmentEndMs: Long? = null
-    private var loopSegment: Boolean = false
-    private var currentMediaUri: Uri? = null
+    private var loopPlayback: Boolean = false
+    private var sourceMediaUri: Uri? = null
+    private var currentPlaybackUri: Uri? = null
     private var preparedFallbackAudioUri: Uri? = null
-    private var retriedAudioOnlyForCurrentMedia: Boolean = false
-    private var retriedTranscodedAudioForCurrentMedia: Boolean = false
-    private var transcodeRecoveryJob: Job? = null
+    private var retriedFallbackAudioForCurrentMedia: Boolean = false
+    private var fallbackRecoveryJob: Job? = null
     private val fallbackAudioCache = mutableMapOf<String, String>()
-    private var activeVideoPlaybackEngine: VideoPlaybackEngine = VideoPlaybackEngine.EXO_PLAYER
     private var currentPlaybackSpeed: Float = 1.0f
+    private var playbackToken: Long = 0L
+    private var activePlaybackToken: Long = 0L
 
     fun init() {
-        if (player != null) {
+        if (mediaPlayer != null) {
             return
         }
 
-        player = ExoPlayer.Builder(context).build().apply {
-            playbackParameters = PlaybackParameters(currentPlaybackSpeed)
-            addListener(object : Player.Listener {
-                override fun onIsPlayingChanged(isPlayingNow: Boolean) {
-                    if (activeVideoPlaybackEngine != VideoPlaybackEngine.EXO_PLAYER) {
-                        return
-                    }
-                    _isPlaying.value = isPlayingNow
-                    if (isPlayingNow) {
-                        startPositionUpdates()
-                    } else {
-                        stopPositionUpdates()
-                    }
+        mediaPlayer = MediaPlayer().apply {
+            setOnPreparedListener { preparedPlayer ->
+                if (activePlaybackToken != playbackToken) {
+                    return@setOnPreparedListener
                 }
 
-                override fun onPlaybackStateChanged(playbackState: Int) {
-                    if (activeVideoPlaybackEngine != VideoPlaybackEngine.EXO_PLAYER) {
-                        return
-                    }
-                    if (playbackState == Player.STATE_READY) {
-                        _durationMs.value = duration.coerceAtLeast(0L)
-                    }
-                    if (playbackState == Player.STATE_ENDED) {
-                        _isPlaying.value = false
-                    }
+                mediaPlayerPrepared = true
+                _durationMs.value = preparedPlayer.duration.coerceAtLeast(0).toLong()
+                applyMediaPlayerPlaybackSpeed(preparedPlayer)
+                preparedPlayer.isLooping = segmentEndMs == null && loopPlayback
+                if (segmentStartMs > 0L) {
+                    preparedPlayer.seekTo(segmentStartMs.toInt())
+                }
+                preparedPlayer.start()
+                _currentPositionMs.value = segmentStartMs.coerceAtLeast(0L)
+                _isPlaying.value = true
+                startPositionUpdates()
+            }
+
+            setOnCompletionListener {
+                if (activePlaybackToken != playbackToken) {
+                    return@setOnCompletionListener
                 }
 
-                override fun onPlayerError(error: PlaybackException) {
-                    if (activeVideoPlaybackEngine != VideoPlaybackEngine.EXO_PLAYER) {
-                        return
-                    }
-                    _isPlaying.value = false
-                    if (tryRecoverWithAudioOnly(this@apply)) {
-                        return
-                    }
-                    if (tryRecoverWithTranscodedAudio(this@apply)) {
-                        return
-                    }
+                _isPlaying.value = false
+                _currentPositionMs.value = _durationMs.value
+                stopPositionUpdates()
+            }
 
-                    val fallbackMessage = error.message
-                        ?.takeUnless { it.equals("Source error", ignoreCase = true) }
-                        ?: "Unable to play this media on this device."
-                    _playbackMessages.tryEmit(
-                        fallbackMessage
-                    )
+            setOnErrorListener { _, _, _ ->
+                if (activePlaybackToken != playbackToken) {
+                    return@setOnErrorListener true
                 }
-            })
+
+                mediaPlayerPrepared = false
+                _isPlaying.value = false
+                stopPositionUpdates()
+                handlePlaybackFailure()
+            }
         }
     }
 
@@ -137,163 +122,150 @@ class AudioPlayer @Inject constructor(
         startTimeMs: Long?,
         endTimeMs: Long?,
         loop: Boolean = false,
-        fallbackAudioPath: String? = null,
-        isVideo: Boolean = false,
-        videoPlaybackEngine: VideoPlaybackEngine = VideoPlaybackEngine.EXO_PLAYER
+        fallbackAudioPath: String? = null
     ) {
         init()
-        val exoPlayer = player ?: return
-        val uri = if (filePath.startsWith("content://") || filePath.startsWith("file://")) {
-            android.net.Uri.parse(filePath)
-        } else {
-            android.net.Uri.fromFile(java.io.File(filePath))
-        }
+        val uri = toMediaUri(filePath)
+        val token = beginNewPlaybackSession()
 
         segmentStartMs = startTimeMs ?: 0L
         segmentEndMs = endTimeMs
-        loopSegment = loop && endTimeMs != null
-        currentMediaUri = uri
-        preparedFallbackAudioUri = fallbackAudioPath?.takeIf { it.isNotBlank() }?.let { path ->
-            if (path.startsWith("content://") || path.startsWith("file://")) {
-                Uri.parse(path)
-            } else {
-                Uri.fromFile(File(path))
-            }
-        }
-        retriedAudioOnlyForCurrentMedia = false
-        retriedTranscodedAudioForCurrentMedia = false
-        transcodeRecoveryJob?.cancel()
-        transcodeRecoveryJob = null
+        loopPlayback = loop
+        sourceMediaUri = uri
+        currentPlaybackUri = uri
+        preparedFallbackAudioUri = fallbackAudioPath
+            ?.takeIf { it.isNotBlank() }
+            ?.let(::toMediaUri)
+        retriedFallbackAudioForCurrentMedia = false
+        fallbackRecoveryJob?.cancel()
+        fallbackRecoveryJob = null
 
-        if (isVideo && videoPlaybackEngine == VideoPlaybackEngine.MEDIA_PLAYER) {
-            activeVideoPlaybackEngine = VideoPlaybackEngine.MEDIA_PLAYER
-            stopExoPlayback()
-            playWithMediaPlayer(uri)
-            return
-        }
-
-        activeVideoPlaybackEngine = VideoPlaybackEngine.EXO_PLAYER
-        resetMediaPlayer()
-        exoPlayer.repeatMode = if (endTimeMs == null && loop) {
-            Player.REPEAT_MODE_ONE
-        } else {
-            Player.REPEAT_MODE_OFF
-        }
-        applyVideoTrackDisabled(exoPlayer, disabled = false)
-
-        exoPlayer.setMediaItem(MediaItem.fromUri(uri))
-        exoPlayer.prepare()
-        exoPlayer.seekTo(segmentStartMs)
-        exoPlayer.playWhenReady = true
+        startPlayback(uri, token)
     }
 
     fun playClip(filePath: String, loop: Boolean = false) {
         playSegment(filePath, null, null, loop)
     }
 
-    fun getPlayer(): ExoPlayer {
-        init()
-        return checkNotNull(player)
-    }
-
-    fun bindMediaPlayerSurface(holder: SurfaceHolder) {
-        mediaPlayerSurfaceHolder = holder
+    fun bindVideoSurface(holder: SurfaceHolder) {
+        videoSurfaceHolder = holder
         mediaPlayer?.setDisplay(holder)
     }
 
-    fun unbindMediaPlayerSurface(holder: SurfaceHolder) {
-        if (mediaPlayerSurfaceHolder === holder) {
-            mediaPlayerSurfaceHolder = null
+    fun unbindVideoSurface(holder: SurfaceHolder) {
+        if (videoSurfaceHolder === holder) {
+            videoSurfaceHolder = null
             mediaPlayer?.setDisplay(null)
         }
     }
 
     fun pause() {
-        when (activeVideoPlaybackEngine) {
-            VideoPlaybackEngine.MEDIA_PLAYER -> {
-                val liveMediaPlayer = mediaPlayer
-                if (mediaPlayerPrepared && liveMediaPlayer?.isPlaying == true) {
-                    liveMediaPlayer.pause()
-                    _isPlaying.value = false
-                    stopPositionUpdates()
-                }
-            }
-            VideoPlaybackEngine.EXO_PLAYER -> player?.pause()
+        val liveMediaPlayer = mediaPlayer
+        if (mediaPlayerPrepared && liveMediaPlayer?.isPlaying == true) {
+            liveMediaPlayer.pause()
+            _isPlaying.value = false
+            stopPositionUpdates()
         }
     }
 
     fun resume() {
-        when (activeVideoPlaybackEngine) {
-            VideoPlaybackEngine.MEDIA_PLAYER -> {
-                val liveMediaPlayer = mediaPlayer
-                if (mediaPlayerPrepared && liveMediaPlayer != null) {
-                    liveMediaPlayer.start()
-                    _isPlaying.value = true
-                    startPositionUpdates()
-                }
-            }
-            VideoPlaybackEngine.EXO_PLAYER -> player?.play()
+        val liveMediaPlayer = mediaPlayer
+        if (mediaPlayerPrepared && liveMediaPlayer != null) {
+            liveMediaPlayer.start()
+            _isPlaying.value = true
+            startPositionUpdates()
         }
     }
 
     fun stop() {
-        when (activeVideoPlaybackEngine) {
-            VideoPlaybackEngine.MEDIA_PLAYER -> resetMediaPlayer()
-            VideoPlaybackEngine.EXO_PLAYER -> player?.stop()
-        }
-        clearSegmentState()
+        invalidatePlaybackToken()
+        resetMediaPlayer()
+        clearPlaybackState()
         _isPlaying.value = false
         _currentPositionMs.value = 0L
         _durationMs.value = 0L
     }
 
     fun seekTo(positionMs: Long) {
-        when (activeVideoPlaybackEngine) {
-            VideoPlaybackEngine.MEDIA_PLAYER -> {
-                if (mediaPlayerPrepared) {
-                    mediaPlayer?.seekTo(positionMs.toInt())
-                }
-            }
-            VideoPlaybackEngine.EXO_PLAYER -> player?.seekTo(positionMs)
+        if (mediaPlayerPrepared) {
+            mediaPlayer?.seekTo(positionMs.coerceAtLeast(0L).toInt())
+            _currentPositionMs.value = positionMs.coerceAtLeast(0L)
         }
     }
 
     fun setPlaybackSpeed(speed: Float) {
         currentPlaybackSpeed = speed
-        player?.playbackParameters = PlaybackParameters(speed)
         applyMediaPlayerPlaybackSpeed(mediaPlayer)
     }
 
     fun release() {
+        invalidatePlaybackToken()
         stopPositionUpdates()
-        clearSegmentState()
-        player?.release()
-        player = null
-        releaseMediaPlayer()
+        clearPlaybackState()
+        runCatching { mediaPlayer?.release() }
+        mediaPlayer = null
+        mediaPlayerPrepared = false
+        videoSurfaceHolder = null
+    }
+
+    private fun beginNewPlaybackSession(): Long {
+        playbackToken += 1
+        activePlaybackToken = playbackToken
+        return playbackToken
+    }
+
+    private fun invalidatePlaybackToken() {
+        playbackToken += 1
+    }
+
+    private fun startPlayback(uri: Uri, token: Long) {
+        init()
+        val liveMediaPlayer = mediaPlayer ?: return
+        activePlaybackToken = token
+        currentPlaybackUri = uri
+        stopPositionUpdates()
+        mediaPlayerPrepared = false
+        _isPlaying.value = false
+        _currentPositionMs.value = segmentStartMs.coerceAtLeast(0L)
+        _durationMs.value = 0L
+
+        runCatching {
+            liveMediaPlayer.reset()
+            liveMediaPlayer.setDisplay(videoSurfaceHolder)
+            liveMediaPlayer.setDataSource(context, uri)
+            liveMediaPlayer.prepareAsync()
+        }.onFailure { error ->
+            mediaPlayerPrepared = false
+            handlePlaybackFailure(
+                error.message ?: "Unable to start playback on this device."
+            )
+        }
     }
 
     private fun startPositionUpdates() {
         stopPositionUpdates()
         positionUpdateRunnable = object : Runnable {
             override fun run() {
+                val liveMediaPlayer = mediaPlayer
                 val currentPosition = getCurrentPlaybackPositionMs() ?: return
                 _currentPositionMs.value = currentPosition
 
                 val endMs = segmentEndMs
                 if (endMs != null && currentPosition >= endMs) {
-                    if (loopSegment) {
-                        restartSegmentPlayback()
+                    if (loopPlayback && mediaPlayerPrepared && liveMediaPlayer != null) {
+                        liveMediaPlayer.seekTo(segmentStartMs.toInt())
+                        liveMediaPlayer.start()
+                        _currentPositionMs.value = segmentStartMs.coerceAtLeast(0L)
                     } else {
-                        pauseActivePlayback()
-                        seekActivePlayback(segmentStartMs)
-                        stopPositionUpdates()
+                        pause()
+                        seekTo(segmentStartMs)
                         _isPlaying.value = false
-                        clearSegmentState()
+                        stopPositionUpdates()
                         return
                     }
                 }
 
-                if (isPlaybackRunning()) {
+                if (mediaPlayerPrepared && liveMediaPlayer?.isPlaying == true) {
                     mainHandler.postDelayed(this, 100L)
                 }
             }
@@ -306,78 +278,23 @@ class AudioPlayer @Inject constructor(
         positionUpdateRunnable = null
     }
 
-    private fun clearSegmentState() {
+    private fun clearPlaybackState() {
         segmentStartMs = 0L
         segmentEndMs = null
-        loopSegment = false
-        currentMediaUri = null
+        loopPlayback = false
+        sourceMediaUri = null
+        currentPlaybackUri = null
         preparedFallbackAudioUri = null
-        retriedAudioOnlyForCurrentMedia = false
-        retriedTranscodedAudioForCurrentMedia = false
-        transcodeRecoveryJob?.cancel()
-        transcodeRecoveryJob = null
-        player?.repeatMode = Player.REPEAT_MODE_OFF
+        retriedFallbackAudioForCurrentMedia = false
+        fallbackRecoveryJob?.cancel()
+        fallbackRecoveryJob = null
     }
 
     private fun getCurrentPlaybackPositionMs(): Long? {
-        return when (activeVideoPlaybackEngine) {
-            VideoPlaybackEngine.MEDIA_PLAYER -> {
-                if (mediaPlayerPrepared) {
-                    mediaPlayer?.currentPosition?.toLong()?.coerceAtLeast(0L)
-                } else {
-                    null
-                }
-            }
-            VideoPlaybackEngine.EXO_PLAYER -> player?.currentPosition?.coerceAtLeast(0L)
-        }
-    }
-
-    private fun isPlaybackRunning(): Boolean {
-        return when (activeVideoPlaybackEngine) {
-            VideoPlaybackEngine.MEDIA_PLAYER -> mediaPlayerPrepared && mediaPlayer?.isPlaying == true
-            VideoPlaybackEngine.EXO_PLAYER -> player?.isPlaying == true
-        }
-    }
-
-    private fun restartSegmentPlayback() {
-        seekActivePlayback(segmentStartMs)
-        when (activeVideoPlaybackEngine) {
-            VideoPlaybackEngine.MEDIA_PLAYER -> {
-                if (mediaPlayerPrepared) {
-                    mediaPlayer?.start()
-                    _isPlaying.value = true
-                }
-            }
-            VideoPlaybackEngine.EXO_PLAYER -> player?.playWhenReady = true
-        }
-    }
-
-    private fun seekActivePlayback(positionMs: Long) {
-        when (activeVideoPlaybackEngine) {
-            VideoPlaybackEngine.MEDIA_PLAYER -> {
-                if (mediaPlayerPrepared) {
-                    mediaPlayer?.seekTo(positionMs.toInt())
-                }
-            }
-            VideoPlaybackEngine.EXO_PLAYER -> player?.seekTo(positionMs)
-        }
-    }
-
-    private fun pauseActivePlayback() {
-        when (activeVideoPlaybackEngine) {
-            VideoPlaybackEngine.MEDIA_PLAYER -> {
-                if (mediaPlayerPrepared && mediaPlayer?.isPlaying == true) {
-                    mediaPlayer?.pause()
-                }
-            }
-            VideoPlaybackEngine.EXO_PLAYER -> player?.pause()
-        }
-    }
-
-    private fun stopExoPlayback() {
-        player?.apply {
-            stop()
-            repeatMode = Player.REPEAT_MODE_OFF
+        return if (mediaPlayerPrepared) {
+            mediaPlayer?.currentPosition?.toLong()?.coerceAtLeast(0L)
+        } else {
+            null
         }
     }
 
@@ -387,166 +304,97 @@ class AudioPlayer @Inject constructor(
         mediaPlayerPrepared = false
     }
 
-    private fun releaseMediaPlayer() {
-        stopPositionUpdates()
-        runCatching { mediaPlayer?.release() }
-        mediaPlayer = null
-        mediaPlayerPrepared = false
-        mediaPlayerSurfaceHolder = null
+    private fun handlePlaybackFailure(
+        defaultMessage: String = "Unable to play this media on this device."
+    ): Boolean {
+        if (tryRecoverWithFallbackAudio()) {
+            return true
+        }
+        _playbackMessages.tryEmit(defaultMessage)
+        return true
     }
 
-    private fun playWithMediaPlayer(uri: Uri) {
-        val liveMediaPlayer = mediaPlayer ?: MediaPlayer().apply {
-            setOnPreparedListener { preparedPlayer ->
-                if (activeVideoPlaybackEngine != VideoPlaybackEngine.MEDIA_PLAYER) {
-                    return@setOnPreparedListener
-                }
-                mediaPlayerPrepared = true
-                _durationMs.value = preparedPlayer.duration.coerceAtLeast(0).toLong()
-                applyMediaPlayerPlaybackSpeed(preparedPlayer)
-                preparedPlayer.isLooping = segmentEndMs == null && loopSegment
-                if (segmentStartMs > 0L) {
-                    preparedPlayer.seekTo(segmentStartMs.toInt())
-                }
-                preparedPlayer.start()
-                _isPlaying.value = true
-                startPositionUpdates()
-            }
-            setOnCompletionListener {
-                if (activeVideoPlaybackEngine != VideoPlaybackEngine.MEDIA_PLAYER) {
-                    return@setOnCompletionListener
-                }
-                _isPlaying.value = false
-                stopPositionUpdates()
-            }
-            setOnErrorListener { _, _, _ ->
-                if (activeVideoPlaybackEngine != VideoPlaybackEngine.MEDIA_PLAYER) {
-                    return@setOnErrorListener true
-                }
-                _isPlaying.value = false
-                stopPositionUpdates()
-                _playbackMessages.tryEmit("Unable to play this video with MediaPlayer.")
-                true
-            }
-        }.also { createdPlayer ->
-            mediaPlayer = createdPlayer
-        }
-
-        stopPositionUpdates()
-        mediaPlayerPrepared = false
-        runCatching {
-            liveMediaPlayer.reset()
-            mediaPlayerSurfaceHolder?.let(liveMediaPlayer::setDisplay)
-            liveMediaPlayer.setDataSource(context, uri)
-            liveMediaPlayer.prepareAsync()
-        }.onFailure { error ->
-            _isPlaying.value = false
-            _playbackMessages.tryEmit(
-                error.message ?: "Unable to start MediaPlayer playback for this video."
-            )
-        }
-    }
-
-    private fun applyMediaPlayerPlaybackSpeed(liveMediaPlayer: MediaPlayer?) {
-        if (!mediaPlayerPrepared || liveMediaPlayer == null) {
-            return
-        }
-        runCatching {
-            val playbackParams = liveMediaPlayer.playbackParams ?: android.media.PlaybackParams()
-            liveMediaPlayer.playbackParams = playbackParams.setSpeed(currentPlaybackSpeed)
-        }
-    }
-
-    private fun tryRecoverWithAudioOnly(exoPlayer: ExoPlayer): Boolean {
-        if (retriedAudioOnlyForCurrentMedia) {
-            return false
-        }
-        val mediaUri = currentMediaUri ?: return false
-
-        return runCatching {
-            retriedAudioOnlyForCurrentMedia = true
-            applyVideoTrackDisabled(exoPlayer, disabled = true)
-            exoPlayer.setMediaItem(MediaItem.fromUri(mediaUri))
-            exoPlayer.prepare()
-            exoPlayer.seekTo(segmentStartMs)
-            exoPlayer.playWhenReady = true
-            true
-        }.getOrDefault(false)
-    }
-
-    private fun tryRecoverWithTranscodedAudio(exoPlayer: ExoPlayer): Boolean {
-        if (retriedTranscodedAudioForCurrentMedia) {
+    private fun tryRecoverWithFallbackAudio(): Boolean {
+        if (retriedFallbackAudioForCurrentMedia) {
             return false
         }
 
-        retriedTranscodedAudioForCurrentMedia = true
-        transcodeRecoveryJob = playbackScope.launch {
-            val preparedFallbackUri = preparedFallbackAudioUri
-                ?.takeIf { uri -> uriToLocalPath(uri)?.let(::File)?.exists() == true }
+        val sourceUri = sourceMediaUri ?: return false
+        retriedFallbackAudioForCurrentMedia = true
+        fallbackRecoveryJob?.cancel()
+        val recoveryToken = playbackToken
+
+        fallbackRecoveryJob = playbackScope.launch {
+            val preparedFallbackAsset = preparedFallbackAudioUri
+                ?.takeIf { uri ->
+                    val path = uriToLocalPath(uri)
+                    path == null || File(path).exists()
+                }
+                ?.let { uri ->
+                    FallbackAudioAsset(
+                        uri = uri,
+                        coversOnlyRequestedSegment = false,
+                        preGenerated = true
+                    )
+                }
+
             var fallbackBuildErrorMessage: String? = null
-            val fallbackAudioAsset = preparedFallbackUri?.let(::uriToLocalPath)?.let { path ->
-                FallbackAudioAsset(
-                    path = path,
-                    coversOnlyRequestedSegment = false
-                )
-            } ?: runCatching {
-                val mediaUri = currentMediaUri ?: return@runCatching null
-                val sourcePath = uriToLocalPath(mediaUri) ?: return@runCatching null
+            val fallbackAudioAsset = preparedFallbackAsset ?: runCatching {
+                val sourcePath = uriToLocalPath(sourceUri) ?: return@runCatching null
                 getOrCreateFallbackAudioAsset(
                     sourcePath = sourcePath,
-                    requestedStartTimeMs = segmentStartMs.takeIf { it > 0L || segmentEndMs != null },
+                    requestedStartTimeMs = segmentStartMs.takeIf {
+                        it > 0L || segmentEndMs != null
+                    },
                     requestedEndTimeMs = segmentEndMs
                 )
             }.onFailure { error ->
                 fallbackBuildErrorMessage = error.message
             }.getOrNull()
 
+            if (!isActive || recoveryToken != playbackToken) {
+                return@launch
+            }
+
             mainHandler.post {
-                val livePlayer = player
-                if (livePlayer == null || livePlayer !== exoPlayer || fallbackAudioAsset == null) {
+                if (recoveryToken != playbackToken) {
+                    return@post
+                }
+
+                if (fallbackAudioAsset == null) {
                     _playbackMessages.tryEmit(
                         fallbackBuildErrorMessage ?: "Unable to play this media on this device."
                     )
                     return@post
                 }
 
-                runCatching {
-                    applyVideoTrackDisabled(livePlayer, disabled = true)
-                    val useSegmentFallback = fallbackAudioAsset.coversOnlyRequestedSegment
-                    livePlayer.repeatMode = if (useSegmentFallback && loopSegment) {
-                        Player.REPEAT_MODE_ONE
-                    } else if (!useSegmentFallback && segmentEndMs == null && loopSegment) {
-                        Player.REPEAT_MODE_ONE
-                    } else {
-                        Player.REPEAT_MODE_OFF
-                    }
-                    livePlayer.setMediaItem(
-                        MediaItem.fromUri(Uri.fromFile(File(fallbackAudioAsset.path)))
-                    )
-                    livePlayer.prepare()
-                    if (useSegmentFallback) {
-                        segmentStartMs = 0L
-                        segmentEndMs = null
-                        livePlayer.seekTo(0L)
-                    } else {
-                        livePlayer.seekTo(segmentStartMs)
-                    }
-                    livePlayer.playWhenReady = true
-                    _playbackMessages.tryEmit(
-                        if (preparedFallbackUri != null) {
-                            "Video playback is incompatible on this device. Switched to pre-generated audio playback."
-                        } else if (useSegmentFallback) {
-                            "Video playback is incompatible on this device. Switched to extracted segment audio playback."
-                        } else {
-                            "Source format is incompatible. Switched to transcoded audio playback."
-                        }
-                    )
-                }.onFailure {
-                    _playbackMessages.tryEmit("Unable to play this media on this device.")
+                if (fallbackAudioAsset.coversOnlyRequestedSegment) {
+                    segmentStartMs = 0L
+                    segmentEndMs = null
                 }
+
+                startPlayback(fallbackAudioAsset.uri, recoveryToken)
+                _playbackMessages.tryEmit(
+                    when {
+                        fallbackAudioAsset.preGenerated ->
+                            "Video playback is incompatible on this device. Switched to pre-generated audio playback."
+                        fallbackAudioAsset.coversOnlyRequestedSegment ->
+                            "Video playback is incompatible on this device. Switched to extracted segment audio playback."
+                        else ->
+                            "Source format is incompatible. Switched to transcoded audio playback."
+                    }
+                )
             }
         }
         return true
+    }
+
+    private fun toMediaUri(path: String): Uri {
+        return if (path.startsWith("content://") || path.startsWith("file://")) {
+            Uri.parse(path)
+        } else {
+            Uri.fromFile(File(path))
+        }
     }
 
     private fun uriToLocalPath(uri: Uri): String? {
@@ -578,8 +426,9 @@ class AudioPlayer @Inject constructor(
         fallbackAudioCache[cacheKey]?.let { cachedPath ->
             if (File(cachedPath).exists()) {
                 return FallbackAudioAsset(
-                    path = cachedPath,
-                    coversOnlyRequestedSegment = hasRequestedSegment
+                    uri = Uri.fromFile(File(cachedPath)),
+                    coversOnlyRequestedSegment = hasRequestedSegment,
+                    preGenerated = false
                 )
             }
         }
@@ -622,15 +471,21 @@ class AudioPlayer @Inject constructor(
 
         fallbackAudioCache[cacheKey] = outputFile.absolutePath
         return FallbackAudioAsset(
-            path = outputFile.absolutePath,
-            coversOnlyRequestedSegment = hasRequestedSegment
+            uri = Uri.fromFile(outputFile),
+            coversOnlyRequestedSegment = hasRequestedSegment,
+            preGenerated = false
         )
     }
 
-    private fun applyVideoTrackDisabled(exoPlayer: ExoPlayer, disabled: Boolean) {
-        exoPlayer.trackSelectionParameters = exoPlayer.trackSelectionParameters
-            .buildUpon()
-            .setTrackTypeDisabled(C.TRACK_TYPE_VIDEO, disabled)
-            .build()
+    private fun applyMediaPlayerPlaybackSpeed(liveMediaPlayer: MediaPlayer?) {
+        if (!mediaPlayerPrepared || liveMediaPlayer == null) {
+            return
+        }
+
+        runCatching {
+            val playbackParams =
+                liveMediaPlayer.playbackParams ?: android.media.PlaybackParams()
+            liveMediaPlayer.playbackParams = playbackParams.setSpeed(currentPlaybackSpeed)
+        }
     }
 }

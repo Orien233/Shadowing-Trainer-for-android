@@ -52,10 +52,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
-import com.orien.shadowing.data.local.VideoPlaybackEngine
-import androidx.media3.exoplayer.ExoPlayer
-import androidx.media3.ui.AspectRatioFrameLayout
-import androidx.media3.ui.PlayerView
 import com.orien.shadowing.domain.usecase.TextCompareUseCase
 import com.orien.shadowing.presentation.components.rememberAudioPermission
 import kotlinx.coroutines.flow.collect
@@ -128,12 +124,8 @@ fun TrainingScreen(
 
                 if (state.hasVideoPlayback) {
                     VideoPlaybackPanel(
-                        mode = state.videoPlaybackEngine,
-                        player = viewModel.getVideoPlayer(),
-                        onUseExoPlayer = viewModel::useExoPlayerMode,
-                        onUseMediaPlayer = viewModel::useMediaPlayerMode,
-                        onBindMediaPlayerSurface = viewModel::bindMediaPlayerSurface,
-                        onUnbindMediaPlayerSurface = viewModel::unbindMediaPlayerSurface
+                        onBindVideoSurface = viewModel::bindVideoSurface,
+                        onUnbindVideoSurface = viewModel::unbindVideoSurface
                     )
                 }
 
@@ -233,85 +225,45 @@ fun TrainingScreen(
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun VideoPlaybackPanel(
-    mode: VideoPlaybackEngine,
-    player: ExoPlayer,
-    onUseExoPlayer: () -> Unit,
-    onUseMediaPlayer: () -> Unit,
-    onBindMediaPlayerSurface: (SurfaceHolder) -> Unit,
-    onUnbindMediaPlayerSurface: (SurfaceHolder) -> Unit
+    onBindVideoSurface: (SurfaceHolder) -> Unit,
+    onUnbindVideoSurface: (SurfaceHolder) -> Unit
 ) {
     Card(modifier = Modifier.fillMaxWidth()) {
         Column(modifier = Modifier.padding(12.dp)) {
             Text("Video", style = MaterialTheme.typography.labelMedium)
             Spacer(modifier = Modifier.height(8.dp))
-            Row(
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                FilterChip(
-                    selected = mode == VideoPlaybackEngine.EXO_PLAYER,
-                    onClick = onUseExoPlayer,
-                    label = { Text("ExoPlayer") }
-                )
-                FilterChip(
-                    selected = mode == VideoPlaybackEngine.MEDIA_PLAYER,
-                    onClick = onUseMediaPlayer,
-                    label = { Text("MediaPlayer") }
-                )
-            }
-            Spacer(modifier = Modifier.height(8.dp))
+            AndroidView(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(220.dp),
+                factory = { context ->
+                    SurfaceView(context).apply {
+                        holder.addCallback(object : SurfaceHolder.Callback {
+                            override fun surfaceCreated(holder: SurfaceHolder) {
+                                onBindVideoSurface(holder)
+                            }
 
-            if (mode == VideoPlaybackEngine.MEDIA_PLAYER) {
-                AndroidView(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(220.dp),
-                    factory = { context ->
-                        SurfaceView(context).apply {
-                            holder.addCallback(object : SurfaceHolder.Callback {
-                                override fun surfaceCreated(holder: SurfaceHolder) {
-                                    onBindMediaPlayerSurface(holder)
-                                }
+                            override fun surfaceChanged(
+                                holder: SurfaceHolder,
+                                format: Int,
+                                width: Int,
+                                height: Int
+                            ) {
+                                onBindVideoSurface(holder)
+                            }
 
-                                override fun surfaceChanged(
-                                    holder: SurfaceHolder,
-                                    format: Int,
-                                    width: Int,
-                                    height: Int
-                                ) {
-                                    onBindMediaPlayerSurface(holder)
-                                }
-
-                                override fun surfaceDestroyed(holder: SurfaceHolder) {
-                                    onUnbindMediaPlayerSurface(holder)
-                                }
-                            })
-                        }
-                    },
-                    update = { view ->
-                        onBindMediaPlayerSurface(view.holder)
+                            override fun surfaceDestroyed(holder: SurfaceHolder) {
+                                onUnbindVideoSurface(holder)
+                            }
+                        })
                     }
-                )
-            } else {
-                AndroidView(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(220.dp),
-                    factory = { context ->
-                        PlayerView(context).apply {
-                            useController = false
-                            resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
-                            this.player = player
-                        }
-                    },
-                    update = { view ->
-                        view.player = player
-                    }
-                )
-            }
+                },
+                update = { view ->
+                    onBindVideoSurface(view.holder)
+                }
+            )
         }
     }
 }

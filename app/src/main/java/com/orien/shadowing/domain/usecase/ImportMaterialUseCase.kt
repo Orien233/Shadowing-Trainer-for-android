@@ -7,6 +7,7 @@ import com.orien.shadowing.data.local.media.PlaybackAssetPreparer
 import com.orien.shadowing.data.local.repository.MaterialRepository
 import com.orien.shadowing.data.model.SentenceEntity
 import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.int
@@ -61,10 +62,15 @@ class ImportMaterialUseCase @Inject constructor(
         data class Error(val message: String) : ImportResult()
     }
 
-    suspend fun importFromDirectory(packageDir: File): ImportResult = withContext(Dispatchers.IO) {
+    suspend fun importFromDirectory(
+        packageDir: File,
+        onProgress: ImportProgressListener = {}
+    ): ImportResult = withContext(Dispatchers.IO) {
         if (!packageDir.isDirectory) {
             return@withContext ImportResult.Error("Not a directory: ${packageDir.absolutePath}")
         }
+
+        onProgress.report(0.05f, "Reading package...")
 
         val metaFile = File(packageDir, "meta.json")
         if (!metaFile.exists()) {
@@ -111,80 +117,107 @@ class ImportMaterialUseCase @Inject constructor(
         }
 
         val storageRoot = getStorageRoot().apply { mkdirs() }
-        val materialId = materialRepository.createMaterial(
-            title = title,
-            type = resolvedType,
-            sourcePath = null,
-            language = language
-        )
+        var materialId: Long? = null
 
-        val materialDir = File(storageRoot, "materials/$materialId").apply { mkdirs() }
-        val copiedSourceMedia = sourceMedia?.let { mediaFile ->
-            copyFile(mediaFile, File(materialDir, mediaFile.name))
-        }
-        val copiedFallbackAudio = copyOptionalFile(
-            sourceRoot = packageDir,
-            targetRoot = materialDir,
-            relativePath = PlaybackAssetPreparer.FALLBACK_AUDIO_FILE_NAME
-        )
-        val preparedAssets = copiedSourceMedia?.let { copiedMedia ->
-            var assets: PlaybackAssetPreparer.PreparedAssets? = null
-            val elapsedMs = measureTimeMillis {
-                assets = PlaybackAssetPreparer.prepare(
-                    materialDir = materialDir,
-                    sourceMediaFile = copiedMedia,
-                    existingFallbackAudio = copiedFallbackAudio
-                )
-            }
-            Log.i(
-                TAG,
-                "Playback asset preparation finished for ${copiedMedia.name}: elapsedMs=$elapsedMs, " +
-                    "usedCompatVideo=${assets?.usedCompatVideo == true}, " +
-                    "primary=${assets?.primaryMediaFile?.name}, fallback=${assets?.fallbackAudioFile?.name}"
+        try {
+            onProgress.report(0.2f, "Creating material...")
+            materialId = materialRepository.createMaterial(
+                title = title,
+                type = resolvedType,
+                sourcePath = null,
+                language = language
             )
-            assets
-        }
-        copyOptionalFile(
-            sourceRoot = packageDir,
-            targetRoot = materialDir,
-            relativePath = ImportMediaUseCase.DISPUTED_SENTENCES_FILE_NAME
-        )
 
-        val sourcePath = preparedAssets?.primaryMediaFile?.absolutePath
-        val fallbackAudioPath = preparedAssets?.fallbackAudioFile?.absolutePath
-        if (sourcePath != null || fallbackAudioPath != null) {
-            materialRepository.getMaterial(materialId)?.let { material ->
-                materialRepository.updateMaterial(
-                    material.copy(
-                        sourcePath = sourcePath,
-                        fallbackAudioPath = fallbackAudioPath
+            val persistedMaterialId = materialId
+                ?: return@withContext ImportResult.Error("Failed to create material.")
+            val materialDir = File(storageRoot, "materials/$persistedMaterialId").apply { mkdirs() }
+
+            onProgress.report(0.4f, "Preparing playback assets...")
+            val copiedSourceMedia = sourceMedia?.let { mediaFile ->
+                copyFile(mediaFile, File(materialDir, mediaFile.name))
+            }
+            val copiedFallbackAudio = copyOptionalFile(
+                sourceRoot = packageDir,
+                targetRoot = materialDir,
+                relativePath = PlaybackAssetPreparer.FALLBACK_AUDIO_FILE_NAME
+            )
+            val preparedAssets = copiedSourceMedia?.let { copiedMedia ->
+                var assets: PlaybackAssetPreparer.PreparedAssets? = null
+                val elapsedMs = measureTimeMillis {
+                    assets = PlaybackAssetPreparer.prepare(
+                        materialDir = materialDir,
+                        sourceMediaFile = copiedMedia,
+                        existingFallbackAudio = copiedFallbackAudio
                     )
+                }
+                Log.i(
+                    TAG,
+                    "Playback asset preparation finished for ${copiedMedia.name}: elapsedMs=$elapsedMs, " +
+                        "usedCompatVideo=${assets?.usedCompatVideo == true}, " +
+                        "primary=${assets?.primaryMediaFile?.name}, fallback=${assets?.fallbackAudioFile?.name}"
+                )
+                assets
+            }
+            copyOptionalFile(
+                sourceRoot = packageDir,
+                targetRoot = materialDir,
+                relativePath = ImportMediaUseCase.DISPUTED_SENTENCES_FILE_NAME
+            )
+
+            val sourcePath = preparedAssets?.primaryMediaFile?.absolutePath
+            val fallbackAudioPath = preparedAssets?.fallbackAudioFile?.absolutePath
+            if (sourcePath != null || fallbackAudioPath != null) {
+                materialRepository.getMaterial(persistedMaterialId)?.let { material ->
+                    materialRepository.updateMaterial(
+                        material.copy(
+                            sourcePath = sourcePath,
+                            fallbackAudioPath = fallbackAudioPath
+                        )
+                    )
+                }
+            }
+
+            onProgress.report(0.8f, "Saving sentences...")
+            val sentenceEntities = sentencesJson.mapIndexed { index, element ->
+                val item = element.jsonObject
+                val clipPath = item["clipFile"]?.jsonPrimitive?.content?.let { relativeClip ->
+                    copyRelativeFile(packageDir, materialDir, relativeClip)?.absolutePath
+                }
+
+                SentenceEntity(
+                    materialId = persistedMaterialId,
+                    index = item["index"]?.jsonPrimitive?.int ?: index,
+                    textOriginal = item["textOriginal"]?.jsonPrimitive?.content ?: "",
+                    textZh = stringOrNull(item, "textZh"),
+                    startTimeMs = longOrNull(item, "startTimeMs"),
+                    endTimeMs = longOrNull(item, "endTimeMs"),
+                    clipPath = clipPath
                 )
             }
-        }
 
-        val sentenceEntities = sentencesJson.mapIndexed { index, element ->
-            val item = element.jsonObject
-            val clipPath = item["clipFile"]?.jsonPrimitive?.content?.let { relativeClip ->
-                copyRelativeFile(packageDir, materialDir, relativeClip)?.absolutePath
+            materialRepository.insertSentences(sentenceEntities)
+            onProgress.report(1f, "Import complete.")
+            ImportResult.Success(persistedMaterialId, sentenceEntities.size)
+        } catch (error: Throwable) {
+            materialId?.let { cleanupPartialImport(it, storageRoot) }
+            if (error is CancellationException) {
+                throw error
             }
-
-            SentenceEntity(
-                materialId = materialId,
-                index = item["index"]?.jsonPrimitive?.int ?: index,
-                textOriginal = item["textOriginal"]?.jsonPrimitive?.content ?: "",
-                textZh = stringOrNull(item, "textZh"),
-                startTimeMs = longOrNull(item, "startTimeMs"),
-                endTimeMs = longOrNull(item, "endTimeMs"),
-                clipPath = clipPath
+            ImportResult.Error(
+                "Failed to import material: ${error.message ?: "unknown error"}"
             )
         }
-
-        materialRepository.insertSentences(sentenceEntities)
-        ImportResult.Success(materialId, sentenceEntities.size)
     }
 
     private fun getStorageRoot(): File = File(context.filesDir, "shadowing_data")
+
+    private suspend fun cleanupPartialImport(materialId: Long, storageRoot: File) {
+        runCatching {
+            materialRepository.deleteMaterial(materialId, storageRoot)
+        }.onFailure { error ->
+            Log.w(TAG, "Failed to clean up partial import $materialId", error)
+        }
+    }
 
     private fun copyRelativeFile(sourceRoot: File, targetRoot: File, relativePath: String): File? {
         val sourceFile = File(sourceRoot, relativePath)

@@ -37,7 +37,8 @@ class ImportMediaUseCase @Inject constructor(
     suspend fun importFromMediaFile(
         mediaFile: File,
         displayName: String = mediaFile.name,
-        mimeType: String? = null
+        mimeType: String? = null,
+        onProgress: ImportProgressListener = {}
     ): ImportMaterialUseCase.ImportResult = withContext(Dispatchers.IO) {
         if (!mediaFile.exists() || !mediaFile.isFile) {
             return@withContext ImportMaterialUseCase.ImportResult.Error(
@@ -45,12 +46,14 @@ class ImportMediaUseCase @Inject constructor(
             )
         }
 
+        onProgress.report(0.05f, "Validating media...")
         if (!isSupportedMediaFile(mediaFile, mimeType)) {
             return@withContext ImportMaterialUseCase.ImportResult.Error(
                 "Unsupported media file: ${displayName.ifBlank { mediaFile.name }}"
             )
         }
 
+        onProgress.report(0.12f, "Initializing speech model...")
         val ready = moonshineAsr.initialize()
         if (!ready) {
             val detail = moonshineAsr.getLastInitErrorMessage()
@@ -67,6 +70,7 @@ class ImportMediaUseCase @Inject constructor(
         try {
             packageDir.mkdirs()
 
+            onProgress.report(0.22f, "Preparing media package...")
             val packagedMediaFile = File(packageDir, buildPackagedMediaName(displayName, mediaFile))
             mediaFile.copyTo(packagedMediaFile, overwrite = true)
             Log.i(
@@ -74,6 +78,7 @@ class ImportMediaUseCase @Inject constructor(
                 "Copied media for import: source=${mediaFile.absolutePath}, package=${packagedMediaFile.absolutePath}"
             )
 
+            onProgress.report(0.4f, "Analyzing media...")
             lateinit var transcript: com.orien.shadowing.data.local.MoonshineAsr.AsrResult
             val transcribeElapsedMs = measureTimeMillis {
                 transcript = moonshineAsr.transcribe(packagedMediaFile.absolutePath)
@@ -102,6 +107,7 @@ class ImportMediaUseCase @Inject constructor(
                 )
             }
 
+            onProgress.report(0.72f, "Generating material package...")
             writeMetaJson(
                 packageDir = packageDir,
                 title = buildMaterialTitle(displayName),
@@ -115,12 +121,20 @@ class ImportMediaUseCase @Inject constructor(
 
             lateinit var importResult: ImportMaterialUseCase.ImportResult
             val packageImportElapsedMs = measureTimeMillis {
-                importResult = importMaterialUseCase.importFromDirectory(packageDir)
+                importResult = importMaterialUseCase.importFromDirectory(packageDir) { progress ->
+                    onProgress.report(
+                        fraction = 0.8f + progress.fraction * 0.2f,
+                        message = progress.message
+                    )
+                }
             }
             Log.i(
                 TAG,
                 "Package import finished for ${packagedMediaFile.name}: elapsedMs=$packageImportElapsedMs, result=$importResult"
             )
+            if (importResult is ImportMaterialUseCase.ImportResult.Success) {
+                onProgress.report(1f, "Import complete.")
+            }
             return@withContext importResult
         } catch (error: Throwable) {
             if (error is CancellationException) {

@@ -20,11 +20,14 @@ class DemoMaterialGenerator @Inject constructor(
     @ApplicationContext private val context: Context,
     private val importMaterialUseCase: ImportMaterialUseCase
 ) {
-    suspend fun generateAndImport(): ImportMaterialUseCase.ImportResult {
+    suspend fun generateAndImport(
+        onProgress: ImportProgressListener = {}
+    ): ImportMaterialUseCase.ImportResult {
+        onProgress.report(0.05f, "Generating demo materials...")
         val demoRoot = File(context.cacheDir, "demo_packages").apply { mkdirs() }
 
-        val packageDirs = listOf(
-            createDemoPackage(
+        val packageSpecs = listOf(
+            "Lesson 1 - Greetings" to createDemoPackage(
                 parentDir = demoRoot,
                 title = "Lesson 1 - Greetings",
                 sentences = listOf(
@@ -35,7 +38,7 @@ class DemoMaterialGenerator @Inject constructor(
                     "Have a wonderful day." to "Farewell"
                 )
             ),
-            createDemoPackage(
+            "Lesson 2 - Daily Routine" to createDemoPackage(
                 parentDir = demoRoot,
                 title = "Lesson 2 - Daily Routine",
                 sentences = listOf(
@@ -46,7 +49,7 @@ class DemoMaterialGenerator @Inject constructor(
                     "I try to go to bed before eleven every night." to "Sleep"
                 )
             ),
-            createDemoPackage(
+            "Lesson 3 - Meeting Phrases" to createDemoPackage(
                 parentDir = demoRoot,
                 title = "Lesson 3 - Meeting Phrases",
                 sentences = listOf(
@@ -59,13 +62,24 @@ class DemoMaterialGenerator @Inject constructor(
             )
         )
 
+        val totalPackages = packageSpecs.size.coerceAtLeast(1)
         val results = buildList {
-            for (packageDir in packageDirs) {
-                add(importMaterialUseCase.importFromDirectory(packageDir))
+            packageSpecs.forEachIndexed { index, (title, packageDir) ->
+                val packageStart = 0.15f + index * (0.8f / totalPackages)
+                val packageSpan = 0.8f / totalPackages
+                add(
+                    importMaterialUseCase.importFromDirectory(packageDir) { progress ->
+                        onProgress.report(
+                            fraction = packageStart + progress.fraction * packageSpan,
+                            message = "Importing $title..."
+                        )
+                    }
+                )
             }
         }
         val successes = results.filterIsInstance<ImportMaterialUseCase.ImportResult.Success>()
         return if (successes.isNotEmpty()) {
+            onProgress.report(1f, "Demo materials ready.")
             ImportMaterialUseCase.ImportResult.Success(
                 materialId = successes.first().materialId,
                 sentenceCount = successes.sumOf { it.sentenceCount }

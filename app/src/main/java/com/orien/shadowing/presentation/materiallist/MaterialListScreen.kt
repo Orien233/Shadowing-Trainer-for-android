@@ -31,7 +31,6 @@ import androidx.compose.material.icons.filled.Videocam
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
-import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -39,12 +38,14 @@ import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
@@ -57,16 +58,21 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
 import com.orien.shadowing.data.model.MaterialEntity
+import com.orien.shadowing.domain.usecase.ImportTaskKind
+import com.orien.shadowing.domain.usecase.ImportTaskSnapshot
+import com.orien.shadowing.domain.usecase.ImportTaskStatus
 import kotlinx.coroutines.flow.collect
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import kotlin.math.roundToInt
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -76,20 +82,20 @@ fun MaterialListScreen(
 ) {
     val state by viewModel.uiState.collectAsState()
     val snackbarHostState = remember { SnackbarHostState() }
-    val context = LocalContext.current
     var renameTarget by remember { mutableStateOf<MaterialEntity?>(null) }
     var renameInput by remember { mutableStateOf("") }
+    var errorTask by remember { mutableStateOf<ImportTaskSnapshot?>(null) }
 
     val dirPickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocumentTree()
     ) { uri ->
-        uri?.let { viewModel.importFromDirectoryUri(it, context) }
+        uri?.let(viewModel::importFromDirectoryUri)
     }
 
     val mediaPickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
     ) { uri ->
-        uri?.let { viewModel.importFromMediaUri(it, context) }
+        uri?.let(viewModel::importFromMediaUri)
     }
 
     LaunchedEffect(Unit) {
@@ -112,42 +118,54 @@ fun MaterialListScreen(
         },
         snackbarHost = { SnackbarHost(snackbarHostState) }
     ) { padding ->
-        Box(modifier = Modifier.fillMaxSize()) {
-            when {
-                state.isLoading -> {
-                    Column(
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .padding(padding),
-                        horizontalAlignment = Alignment.CenterHorizontally,
-                        verticalArrangement = Arrangement.Center
-                    ) {
-                        CircularProgressIndicator()
-                        state.importMessage?.let { message ->
-                            Spacer(modifier = Modifier.height(16.dp))
-                            Text(message, style = MaterialTheme.typography.bodyLarge)
+        when {
+            state.materials.isEmpty() && state.importTasks.isEmpty() -> {
+                EmptyMaterialsView(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(padding),
+                    onImportClick = viewModel::showImportSheet
+                )
+            }
+
+            else -> {
+                LazyColumn(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(padding),
+                    contentPadding = PaddingValues(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    if (state.importTasks.isNotEmpty()) {
+                        item("import_header") {
+                            SectionTitle("Import Queue")
+                        }
+                        items(
+                            items = state.importTasks,
+                            key = { task -> task.id }
+                        ) { task ->
+                            ImportTaskCard(
+                                task = task,
+                                onClick = {
+                                    if (task.status == ImportTaskStatus.FAILED) {
+                                        errorTask = task
+                                    }
+                                }
+                            )
                         }
                     }
-                }
 
-                state.materials.isEmpty() -> {
-                    EmptyMaterialsView(
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .padding(padding),
-                        onImportClick = viewModel::showImportSheet
-                    )
-                }
-
-                else -> {
-                    LazyColumn(
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .padding(padding),
-                        contentPadding = PaddingValues(16.dp),
-                        verticalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        items(state.materials, key = { it.id }) { material ->
+                    if (state.materials.isNotEmpty()) {
+                        if (state.importTasks.isNotEmpty()) {
+                            item("materials_header") {
+                                Spacer(modifier = Modifier.height(8.dp))
+                                SectionTitle("Materials")
+                            }
+                        }
+                        items(
+                            items = state.materials,
+                            key = { material -> material.id }
+                        ) { material ->
                             MaterialCard(
                                 material = material,
                                 onClick = { viewModel.onMaterialClick(material.id) },
@@ -190,6 +208,24 @@ fun MaterialListScreen(
             dismissButton = {
                 TextButton(onClick = { renameTarget = null }) {
                     Text("Cancel")
+                }
+            }
+        )
+    }
+
+    errorTask?.let { task ->
+        AlertDialog(
+            onDismissRequest = { errorTask = null },
+            title = { Text(task.title) },
+            text = {
+                Text(
+                    text = task.errorMessage ?: "Unknown error.",
+                    style = MaterialTheme.typography.bodyMedium
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = { errorTask = null }) {
+                    Text("Close")
                 }
             }
         )
@@ -248,7 +284,150 @@ private fun EmptyMaterialsView(
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun SectionTitle(text: String) {
+    Text(
+        text = text,
+        style = MaterialTheme.typography.titleSmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        modifier = Modifier.padding(bottom = 4.dp)
+    )
+}
+
+@Composable
+private fun ImportTaskCard(
+    task: ImportTaskSnapshot,
+    onClick: () -> Unit
+) {
+    val statusColor = when (task.status) {
+        ImportTaskStatus.RUNNING -> MaterialTheme.colorScheme.primary
+        ImportTaskStatus.QUEUED -> MaterialTheme.colorScheme.tertiary
+        ImportTaskStatus.FAILED -> MaterialTheme.colorScheme.error
+    }
+    val detailText = when (task.status) {
+        ImportTaskStatus.RUNNING -> {
+            val progressPercent = ((task.progress ?: 0f) * 100).roundToInt().coerceIn(0, 100)
+            "$progressPercent% - ${task.message}"
+        }
+
+        ImportTaskStatus.QUEUED -> task.message
+        ImportTaskStatus.FAILED -> task.errorMessage ?: task.message
+    }
+
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick)
+    ) {
+        Row(
+            modifier = Modifier.padding(16.dp),
+            verticalAlignment = Alignment.Top
+        ) {
+            Icon(
+                imageVector = when (task.kind) {
+                    ImportTaskKind.AUDIO -> Icons.Default.Headphones
+                    ImportTaskKind.VIDEO -> Icons.Default.Videocam
+                    ImportTaskKind.FOLDER -> Icons.Default.FolderOpen
+                    ImportTaskKind.DEMO -> Icons.Default.AutoAwesome
+                },
+                contentDescription = null,
+                tint = statusColor,
+                modifier = Modifier.size(32.dp)
+            )
+
+            Spacer(modifier = Modifier.width(12.dp))
+
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = task.title,
+                    style = MaterialTheme.typography.titleMedium,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                Spacer(modifier = Modifier.height(6.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    MetadataPill(
+                        text = taskKindLabel(task.kind),
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                    MetadataPill(
+                        text = queueLabel(task),
+                        color = statusColor
+                    )
+                }
+                Spacer(modifier = Modifier.height(8.dp))
+                if (task.status == ImportTaskStatus.RUNNING) {
+                    LinearProgressIndicator(
+                        progress = { task.progress ?: 0f },
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                }
+                Text(
+                    text = detailText,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = if (task.status == ImportTaskStatus.FAILED) {
+                        MaterialTheme.colorScheme.error
+                    } else {
+                        MaterialTheme.colorScheme.onSurfaceVariant
+                    },
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun MetadataPill(
+    text: String,
+    color: Color
+) {
+    Surface(
+        color = color.copy(alpha = 0.12f),
+        shape = MaterialTheme.shapes.small
+    ) {
+        Text(
+            text = text,
+            modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
+            style = MaterialTheme.typography.labelSmall,
+            color = color
+        )
+    }
+}
+
+private fun taskKindLabel(kind: ImportTaskKind): String = when (kind) {
+    ImportTaskKind.AUDIO -> "AUDIO"
+    ImportTaskKind.VIDEO -> "VIDEO"
+    ImportTaskKind.FOLDER -> "FOLDER"
+    ImportTaskKind.DEMO -> "DEMO"
+}
+
+private fun queueLabel(task: ImportTaskSnapshot): String {
+    val position = task.queuePosition
+    val total = task.activeTaskCount
+    return when (task.status) {
+        ImportTaskStatus.RUNNING -> {
+            if (position != null && total != null) {
+                "Queue $position/$total"
+            } else {
+                "Processing"
+            }
+        }
+
+        ImportTaskStatus.QUEUED -> {
+            if (position != null && total != null) {
+                "Queued $position/$total"
+            } else {
+                "Queued"
+            }
+        }
+
+        ImportTaskStatus.FAILED -> "Failed"
+    }
+}
+
 @Composable
 private fun MaterialCard(
     material: MaterialEntity,
@@ -452,9 +631,10 @@ private fun ImportBottomSheet(
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun ImportOption(
-    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    icon: ImageVector,
     title: String,
     description: String,
     onClick: () -> Unit

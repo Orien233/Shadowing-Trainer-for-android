@@ -4,9 +4,13 @@
 
 ## 项目现状
 
-# 当前项目暂时停止更新，目前优先修改完善原型设计（详见项目简介about部分的连接仓库）
+## 当前项目暂时停止更新，目前优先修改完善原型设计（详见项目简介about部分的连接仓库）
 
-当前代码已经实现的主流程：
+## ## APK 下载
+
+[点击下载 Shadowing Trainer Android APK](https://github.com/Orien233/Shadowing-Trainer-for-android/releases/download/APK/Shadowing.trainer.apk)
+
+当前版本已经实现的主流程：
 
 - 素材列表
   - 展示所有素材
@@ -44,15 +48,6 @@
 - ASR：Moonshine（JNI + C++ + ONNX Runtime，本地推理）
 - 发音提示：内置英文 G2P 字典 `app/src/main/assets/dictionary/base_g2p_dict.json`
 - 构建：AGP `8.7.3`，Kotlin `2.1.0`，Java `17`
-
-## 与旧 README 不一致的地方
-
-这几个点已经按当前代码修正：
-
-- 播放器不是 ExoPlayer，当前实现是 `MediaPlayer`
-- 默认模型不是 `tiny-en`，仓库实际内置的是 `app/src/main/assets/moonshine/medium-streaming-en`
-- 训练页不只是文本比对，还包含基于 G2P 的单词级发音提示
-- 仓库当前没有提交 `gradlew` / `gradlew.bat`
 
 ## 快速开始
 

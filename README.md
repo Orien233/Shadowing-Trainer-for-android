@@ -6,7 +6,7 @@
 
 ## 当前项目暂时停止更新，目前优先修改完善原型设计（详见项目简介about部分的连接仓库）
 
-## ## APK 下载
+## APK 下载
 
 [点击下载 Shadowing Trainer Android APK](https://github.com/Orien233/Shadowing-Trainer-for-android/releases/download/APK/Shadowing.trainer.apk)
 
